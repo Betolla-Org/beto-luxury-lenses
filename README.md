@@ -48,6 +48,8 @@ engine/              AR helpers shared by web and mobile (unit tested)
   eye.ts             Measure an eye (MediaPipe or ML Kit outline), EyeTracker (smoothing, blinks, ellipse)
                      and FaceTracker (both eyes, one shared iris size)
   iris.ts            Finds the iris edge in the pixels and fits a circle to it (refines the landmarks)
+  lighting.ts        Light around the eyes -> pupil size, glare and cover strength of the lens
+  quality.ts         Shot-quality checks (light, distance, framing, head turn) -> steady user hints
   lens-style.ts      The lens look (colors, ring, pupil, glare) used by both renderers
   fit.ts             Lens fit score: overlap of painted lens vs visible iris
   web.ts             Browser-only exports:
@@ -65,8 +67,12 @@ dev/lens-fit.html    Dev-only page: old vs new lens fit on face photos
 2. The mirrored video is drawn with `object-fit: cover` math (`coverRect`), and landmarks are mapped through the same rect so lenses line up with the eyes.
 3. `measureMediaPipeEye` reads the iris (center averaged over 5 points, width and height from its edge points, and the angle of its left-right axis) and the eye-opening outline.
 4. `refineIris` reads one pixel block around both eyes from the frame just drawn, casts rays sideways from each iris center (the lids cover the top and bottom), finds the dark-to-light step where the iris meets the white of the eye, and fits a circle to those points with outlier rejection. `applyIrisRefinement` moves the center 70% of the way to that fit, and the size too while the iris looks round. With weak evidence it keeps the landmarks.
-5. `FaceTracker` gives both eyes one shared iris size (average of both readings, one-frame glitches ignored) and runs one `EyeTracker` per eye, which hides the lens while that eye is closed (the `eyeBlink` blendshape, with hysteresis; lid gap / eye width when no blendshapes are available, as on mobile), smooths position and size with One Euro filters, turns the iris width/height ratio into an elliptical lens when the head turns, follows head roll, and rounds the 16-point eye outline into a smooth curve.
+5. `FaceTracker` gives both eyes one shared iris size (average of both readings, one-frame glitches ignored) and runs one `EyeTracker` per eye, which fades the lens out and back in through a blink (`eyeVisibility`: the `eyeBlink` blendshape, or lid gap / eye width when no blendshapes are available, as on mobile), smooths position and size with One Euro filters, turns the iris width/height ratio into an elliptical lens when the head turns, follows head roll, and rounds the 16-point eye outline into a smooth curve.
 6. `drawLens` paints a limbal ring, a colored donut that leaves the pupil clear, and a glare highlight, sized and shaped to the iris and **clipped to the eye opening** so nothing lands on the eyelids. In realistic mode the edge is feathered, the upper lid casts a shadow, and the tint is blended so the eye's own iris texture shows through.
+
+7. The same pixel block gives the light level around the eyes, smoothed over seconds: `lensLighting` widens the pupil and tones down the glare and painted cover in dim light, so a light lens does not glow in a dark room.
+8. `QualityMonitor` turns light, iris size in camera pixels, framing and head yaw into one hint at a time ("Find more light", "Move a little closer", "Move back a little", "Face the camera"), shown only once an issue lasts 0.8 s and cleared after 0.5 s without it.
+9. When a frame has no face, `FaceTracker.lose` keeps the last lenses for 150 ms, fading, so one missed detection does not flash them off; after that it resets so the next lock snaps into place.
 
 There is no latency prediction: each lens is drawn on the very frame it was measured on, so predicting ahead would push it past the eye.
 

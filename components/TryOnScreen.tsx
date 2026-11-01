@@ -4,10 +4,19 @@ import { Lens } from '../types';
 import { LENSES } from '../constants';
 import {
   EyeMeasurement,
+  EyeState,
   FaceTracker,
+  OneEuroFilter,
+  QUALITY_LANDMARKS,
+  QualityIssue,
+  QualityMonitor,
   applyIrisRefinement,
   blendshapeScores,
+  headYaw,
+  lensLighting,
+  meanLuminance,
   refineIris,
+  trueIrisDiameter,
   LEFT_EYE,
   RIGHT_EYE,
   Point,
@@ -23,6 +32,14 @@ const LENS_OPACITY = 0.65; // 35% transparent (65% opaque) so color shows proper
 const MIN_SIZE = 0.8;
 const MAX_SIZE = 1.3;
 
+/** What to tell the user when the shot hurts tracking (engine/quality.ts). */
+const HINTS: Record<QualityIssue, { icon: string; text: string }> = {
+  MORE_LIGHT: { icon: 'light_mode', text: 'Find more light' },
+  MOVE_CLOSER: { icon: 'zoom_in', text: 'Move a little closer' },
+  MOVE_BACK: { icon: 'zoom_out', text: 'Move back a little' },
+  FACE_CAMERA: { icon: 'face', text: 'Face the camera' },
+};
+
 interface TryOnScreenProps {
   lens: Lens;
   onBack: () => void;
@@ -35,6 +52,7 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
   const currentLensRef = useRef(initialLens); // Ref to hold the latest lens for the animation loop
   const [cameraState, setCameraState] = useState<'LOADING' | 'READY' | 'ERROR' | 'PERMISSION_DENIED'>('LOADING');
   const [trackingStatus, setTrackingStatus] = useState<'SEARCHING' | 'LOCKED'>('SEARCHING');
+  const [hint, setHint] = useState<QualityIssue | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [generatedImage, setGeneratedImage] = useState<string | null>(null);
   const [sizeAdjustment, setSizeAdjustment] = useState(1.0);
@@ -56,6 +74,10 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
 
   // Smoothing, shared iris size and blink state for both eyes, kept outside React so the render loop never re-renders
   const faceTracker = useRef(new FaceTracker());
+  // Light around the eyes, smoothed over seconds: drives the lens pupil, glare and cover (engine/lighting.ts)
+  const luminanceFilter = useRef(new OneEuroFilter(0.3, 0));
+  const lightingRef = useRef(lensLighting(128));
+  const qualityMonitor = useRef(new QualityMonitor());
   // The render loop is started once, so it reads the size through a ref, not the stale state
   const sizeAdjustmentRef = useRef(sizeAdjustment);
   useEffect(() => {
@@ -160,24 +182,46 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
   // --- RENDER LOOP ---
   /**
    * Sharpens the landmark measurements with the frame's own pixels: finds each iris edge
-   * (engine/iris.ts). Must run after the video frame is drawn and before any lens is.
-   * Reads one pixel block covering both eyes, because every canvas readback stalls the GPU.
+   * (engine/iris.ts), and measures the light around the eyes. Must run after the video frame
+   * is drawn and before any lens is. Reads one pixel block covering both eyes, because every
+   * canvas readback stalls the GPU.
    */
-  const refineWithPixels = (ctx: CanvasRenderingContext2D, eyes: (EyeMeasurement | null)[]) => {
+  const readPixels = (ctx: CanvasRenderingContext2D, eyes: (EyeMeasurement | null)[]) => {
     const found = eyes.filter((m): m is EyeMeasurement => !!m);
-    if (!found.length) return eyes;
+    if (!found.length) return { eyes };
     const reach = (m: EyeMeasurement) => Math.ceil(m.irisDiameter * 0.8) + 2;
     const x0 = Math.max(0, Math.floor(Math.min(...found.map(m => m.center.x - reach(m)))));
     const y0 = Math.max(0, Math.floor(Math.min(...found.map(m => m.center.y - reach(m)))));
     const x1 = Math.min(ctx.canvas.width, Math.ceil(Math.max(...found.map(m => m.center.x + reach(m)))));
     const y1 = Math.min(ctx.canvas.height, Math.ceil(Math.max(...found.map(m => m.center.y + reach(m)))));
-    if (x1 - x0 < 8 || y1 - y0 < 8) return eyes;
+    if (x1 - x0 < 8 || y1 - y0 < 8) return { eyes };
     const image = ctx.getImageData(x0, y0, x1 - x0, y1 - y0);
     const patch = { data: image.data, width: image.width, height: image.height, x: x0, y: y0 };
-    return eyes.map(m => m && applyIrisRefinement(m, refineIris(patch, { x: m.center.x, y: m.center.y, r: m.irisDiameter / 2 }, m.outline)));
+    return {
+      eyes: eyes.map(m => m && applyIrisRefinement(m, refineIris(patch, { x: m.center.x, y: m.center.y, r: m.irisDiameter / 2 }, m.outline))),
+      luminance: meanLuminance(patch),
+    };
   };
 
-  const drawLenses = (
+  const paintLenses = (ctx: CanvasRenderingContext2D, eyes: (EyeState | null)[]) => {
+      const color = currentLensRef.current.color;
+      const light = lightingRef.current;
+      for (const eye of eyes) {
+          if (!eye) continue;
+          drawLens(ctx, eye.x, eye.y, eye.radiusX, color, {
+              opacity: LENS_OPACITY * eye.opacity,
+              clip: eye.outline,
+              realistic: true,
+              radiusY: eye.radiusY,
+              rotation: eye.rotation,
+              pupilRatio: light.pupilRatio,
+              glare: light.glare,
+              cover: light.cover,
+          });
+      }
+  };
+
+  const trackFace = (
     ctx: CanvasRenderingContext2D,
     landmarks: Point[],
     blendshapes: Record<string, number>,
@@ -185,25 +229,35 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
     vW: number, vH: number, canvasW: number, canvasH: number
   ) => {
       const project = (lm: Point) => mapLandmark(lm, vW, vH, canvasW, canvasH);
-      const color = currentLensRef.current.color;
 
-      // Measure both eyes before painting anything, so the pixel refinement only sees the camera image
-      const [right, left] = refineWithPixels(ctx, [
+      // Measure both eyes before painting anything, so the pixel reads only see the camera image
+      const pixels = readPixels(ctx, [
           measureMediaPipeEye(landmarks, RIGHT_EYE, project, blendshapes),
           measureMediaPipeEye(landmarks, LEFT_EYE, project, blendshapes),
       ]);
-      const eyes = faceTracker.current.update(right, left, sizeAdjustmentRef.current, timeMs);
-
-      for (const eye of [eyes.right, eyes.left]) {
-          if (!eye) continue;
-          drawLens(ctx, eye.x, eye.y, eye.radiusX, color, {
-              opacity: LENS_OPACITY,
-              clip: eye.outline,
-              realistic: true,
-              radiusY: eye.radiusY,
-              rotation: eye.rotation,
-          });
+      const [right, left] = pixels.eyes;
+      if (pixels.luminance !== undefined) {
+          lightingRef.current = lensLighting(luminanceFilter.current.filter(pixels.luminance, timeMs));
       }
+      const eyes = faceTracker.current.update(right, left, sizeAdjustmentRef.current, timeMs);
+      paintLenses(ctx, [eyes.right, eyes.left]);
+
+      // Hints: enough light and iris detail, whole face in view, facing the camera?
+      const measured = [right, left].filter((m): m is EyeMeasurement => !!m);
+      const canvasPerVideoPixel = coverRect(vW, vH, canvasW, canvasH).width / vW;
+      const { noseTip, cheekRight, cheekLeft, forehead, chin } = QUALITY_LANDMARKS;
+      const outside = (p: Point) => p.x < 0 || p.y < 0 || p.x > canvasW || p.y > canvasH;
+      const issue = qualityMonitor.current.update({
+          luminance: pixels.luminance,
+          irisPixels: measured.length
+              ? measured.reduce((sum, m) => sum + trueIrisDiameter(m), 0) / measured.length / canvasPerVideoPixel
+              : undefined,
+          faceCropped: [cheekRight, cheekLeft, forehead, chin].some(i => landmarks[i] && outside(project(landmarks[i]))),
+          yaw: landmarks[noseTip] && landmarks[cheekRight] && landmarks[cheekLeft]
+              ? headYaw(landmarks[noseTip], landmarks[cheekRight], landmarks[cheekLeft])
+              : undefined,
+      }, timeMs);
+      setHint(issue);
   };
 
   /**
@@ -247,11 +301,16 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
     if (face) {
       setTrackingStatus('LOCKED');
       const blendshapes = blendshapeScores(result?.faceBlendshapes[0]?.categories);
-      drawLenses(ctx, face, blendshapes, detectTime, vW, vH, canvasW, canvasH);
+      trackFace(ctx, face, blendshapes, detectTime, vW, vH, canvasW, canvasH);
     } else {
-      // Reset so the next lock snaps into place instead of gliding in
-      faceTracker.current.reset();
-      setTrackingStatus('SEARCHING');
+      // Keep the last lenses briefly (fading) so one missed detection does not flash them off
+      const held = faceTracker.current.lose(detectTime);
+      paintLenses(ctx, [held.right, held.left]);
+      if (!held.right && !held.left) {
+        qualityMonitor.current.reset();
+        setHint(null);
+        setTrackingStatus('SEARCHING');
+      }
     }
   };
 
@@ -320,6 +379,12 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
                 <div className={`w-2 h-2 rounded-full ${trackingStatus === 'LOCKED' ? 'bg-green-500' : 'bg-red-500 animate-pulse'}`}></div>
                 <p className="text-white/50 text-[10px] uppercase">{trackingStatus === 'LOCKED' ? 'LIVE TRACKING' : 'SEARCHING...'}</p>
             </div>
+            {hint && trackingStatus === 'LOCKED' && (
+                <div role="status" className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-black/50 backdrop-blur border border-luxury-gold/40 px-3 py-1 text-luxury-gold text-[11px] font-bold tracking-wider">
+                    <span className="material-symbols-outlined text-[14px] leading-none">{HINTS[hint].icon}</span>
+                    {HINTS[hint].text}
+                </div>
+            )}
         </div>
         <div className="w-10 h-10"></div>
       </div>

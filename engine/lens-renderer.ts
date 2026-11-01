@@ -17,6 +17,10 @@ export interface LensRenderOptions {
   radiusY?: number;
   /** Rotation of the lens's x axis in radians (head roll). */
   rotation?: number;
+  /** Multiplier on the glare highlight (see engine/lighting.ts). */
+  glare?: number;
+  /** Realistic mode: multiplier on the painted-on cover color (see engine/lighting.ts). */
+  cover?: number;
 }
 
 // How the realistic mode mixes the lens in. Tuned with dev/lens-fit.html.
@@ -51,17 +55,26 @@ const paintLens = (
   hexColor: string,
   pupilRatio: number,
   ry = r,
-  rotation = 0
+  rotation = 0,
+  glareStrength = 1
 ) => {
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(rotation);
   ctx.scale(1, ry / r);
-  paintRoundLens(ctx, 0, 0, r, hexColor, pupilRatio);
+  paintRoundLens(ctx, 0, 0, r, hexColor, pupilRatio, glareStrength);
   ctx.restore();
 };
 
-const paintRoundLens = (ctx: CanvasRenderingContext2D, x: number, y: number, r: number, hexColor: string, pupilRatio: number) => {
+const paintRoundLens = (
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  r: number,
+  hexColor: string,
+  pupilRatio: number,
+  glareStrength: number
+) => {
   const style = lensStyle(hexColor, pupilRatio);
   const outer = r * style.body.outerRatio;
   const pupil = r * style.pupilRatio;
@@ -88,6 +101,7 @@ const paintRoundLens = (ctx: CanvasRenderingContext2D, x: number, y: number, r: 
   const glare = ctx.createRadialGradient(gx, gy, 0, gx, gy, r * style.glare.radiusRatio);
   glare.addColorStop(0, style.glare.color);
   glare.addColorStop(1, style.glare.fade);
+  ctx.globalAlpha *= glareStrength;
   ctx.fillStyle = glare;
   ctx.beginPath();
   ctx.arc(x, y, outer, 0, Math.PI * 2);
@@ -102,7 +116,7 @@ export const drawLens = (
   y: number,
   r: number,
   hexColor: string,
-  { opacity = 0.65, pupilRatio = 0.25, clip, realistic = false, radiusY = r, rotation = 0 }: LensRenderOptions = {}
+  { opacity = 0.65, pupilRatio = 0.25, clip, realistic = false, radiusY = r, rotation = 0, glare = 1, cover = 1 }: LensRenderOptions = {}
 ) => {
   if (r <= 0 || radiusY <= 0) return;
   const hasClip = !!clip && clip.length >= 3;
@@ -115,7 +129,7 @@ export const drawLens = (
     }
     ctx.globalAlpha = opacity;
     ctx.globalCompositeOperation = 'source-over';
-    paintLens(ctx, x, y, r, hexColor, pupilRatio, radiusY, rotation);
+    paintLens(ctx, x, y, r, hexColor, pupilRatio, radiusY, rotation, glare);
     ctx.restore();
     return;
   }
@@ -130,7 +144,7 @@ export const drawLens = (
   const oy = extent + pad - y;
   s.save();
   s.clearRect(0, 0, size, size);
-  paintLens(s, x + ox, y + oy, r, hexColor, pupilRatio, radiusY, rotation);
+  paintLens(s, x + ox, y + oy, r, hexColor, pupilRatio, radiusY, rotation, glare);
 
   // Upper-lid shadow: the lid shades the top of the iris
   const lidTop = Math.min(...clip!.map(p => p.y)) + oy;
@@ -156,7 +170,7 @@ export const drawLens = (
   ctx.globalAlpha = opacity * TINT_STRENGTH / 0.65;
   ctx.drawImage(canvas, 0, 0, size, size, dx, dy, size, size);
   ctx.globalCompositeOperation = 'source-over';
-  ctx.globalAlpha = opacity * COVER_STRENGTH / 0.65;
+  ctx.globalAlpha = Math.min(1, (opacity * COVER_STRENGTH * cover) / 0.65);
   ctx.drawImage(canvas, 0, 0, size, size, dx, dy, size, size);
   ctx.restore();
 };

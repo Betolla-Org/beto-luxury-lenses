@@ -2,8 +2,14 @@ import { readFileSync } from 'fs';
 import { describe, expect, it } from 'vitest';
 import { TASKS_VISION_VERSION } from './mediapipe-assets';
 import {
-  BlinkDetector,
   EyeMeasurement,
+  LOST_FACE_HOLD_MS,
+  QualityMonitor,
+  eyeVisibility,
+  headYaw,
+  lensLighting,
+  meanLuminance,
+  qualityIssues,
   EyeTracker,
   FaceTracker,
   applyIrisRefinement,
@@ -102,21 +108,20 @@ describe('blink detection', () => {
     expect(near).toBeCloseTo(far);
   });
 
-  it('uses hysteresis between closing and reopening', () => {
-    const b = new BlinkDetector(0.16, 0.2);
-    expect(b.update(0.3)).toBe(false);
-    expect(b.update(0.1)).toBe(true);
-    expect(b.update(0.18)).toBe(true); // still closed inside the band
-    expect(b.update(0.25)).toBe(false);
+  it('fades the lens out as the lids close (lid gap)', () => {
+    expect(eyeVisibility({ openness: 0.3 })).toBe(1);
+    expect(eyeVisibility({ openness: 0.1 })).toBe(0);
+    const half = eyeVisibility({ openness: 0.18 });
+    expect(half).toBeGreaterThan(0.2);
+    expect(half).toBeLessThan(0.8);
   });
 
   it('prefers the blendshape blink score over the lid gap when given', () => {
-    const b = new BlinkDetector();
-    // Lid gap says closed (e.g. looking down), blendshape says open: stays open
-    expect(b.update(0.1, 0.3)).toBe(false);
-    expect(b.update(0.3, 0.8)).toBe(true);
-    expect(b.update(0.3, 0.5)).toBe(true); // still closed inside the band
-    expect(b.update(0.3, 0.2)).toBe(false);
+    // Lid gap says closed (e.g. looking down), blendshape says open: stays visible
+    expect(eyeVisibility({ openness: 0.1, blink: 0.3 })).toBe(1);
+    // Looking down raises the score to ~0.5: barely dims
+    expect(eyeVisibility({ openness: 0.3, blink: 0.5 })).toBeGreaterThan(0.9);
+    expect(eyeVisibility({ openness: 0.3, blink: 0.85 })).toBe(0);
   });
 });
 
@@ -232,7 +237,10 @@ describe('EyeTracker', () => {
     const lm = buildFace(10);
     expect(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.9))!.blink).toBe(0.9);
     expect(new EyeTracker().update(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.9)), 1, 0)).toBeNull();
-    expect(new EyeTracker().update(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.1)), 1, 0)).not.toBeNull();
+    expect(new EyeTracker().update(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.1)), 1, 0)!.opacity).toBe(1);
+    const fading = new EyeTracker().update(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.6)), 1, 0)!;
+    expect(fading.opacity).toBeGreaterThan(0);
+    expect(fading.opacity).toBeLessThan(1);
   });
 
   it('returns null when landmarks are missing', () => {
@@ -372,5 +380,72 @@ describe('iris pixel refinement', () => {
     expect(turned.center).toEqual({ x: 50, y: 50 });
     expect(turned.irisShape!.width).toBe(16);
     expect(applyIrisRefinement(base, null)).toBe(base);
+  });
+});
+
+describe('lost face hold', () => {
+  const eye = (): EyeMeasurement => ({
+    center: { x: 50, y: 50 },
+    irisDiameter: 10,
+    openness: 0.3,
+    outline: [{ x: 30, y: 50 }, { x: 50, y: 40 }, { x: 70, y: 50 }, { x: 50, y: 60 }],
+  });
+
+  it('keeps the last lenses briefly, fading, then lets go', () => {
+    const face = new FaceTracker();
+    face.update(eye(), eye(), 1, 1000);
+    const held = face.lose(1000 + LOST_FACE_HOLD_MS / 2);
+    expect(held.right!.x).toBe(50);
+    expect(held.right!.opacity).toBeCloseTo(0.5);
+    expect(face.lose(1000 + LOST_FACE_HOLD_MS + 1)).toEqual({ right: null, left: null });
+  });
+
+  it('holds nothing before any face was seen', () => {
+    expect(new FaceTracker().lose(0)).toEqual({ right: null, left: null });
+  });
+});
+
+describe('lighting', () => {
+  const flat = (v: number) => {
+    const data = new Uint8ClampedArray(10 * 10 * 4).fill(v);
+    return { data, width: 10, height: 10, x: 0, y: 0 };
+  };
+
+  it('measures mean luminance', () => {
+    expect(meanLuminance(flat(100))).toBeCloseTo(100);
+  });
+
+  it('widens the pupil and tones the lens down in dim light', () => {
+    const dim = lensLighting(20);
+    const bright = lensLighting(200);
+    expect(dim.pupilRatio).toBeGreaterThan(bright.pupilRatio);
+    expect(dim.cover).toBeLessThan(bright.cover);
+    expect(dim.glare).toBeLessThan(bright.glare);
+  });
+});
+
+describe('quality hints', () => {
+  it('orders issues by importance', () => {
+    expect(qualityIssues({ luminance: 20, irisPixels: 8, yaw: 0.5 })).toEqual(['MORE_LIGHT', 'MOVE_CLOSER', 'FACE_CAMERA']);
+    expect(qualityIssues({ luminance: 120, irisPixels: 30, yaw: 0 })).toEqual([]);
+    expect(qualityIssues({ faceCropped: true })).toEqual(['MOVE_BACK']);
+  });
+
+  it('measures head yaw from the nose and cheeks', () => {
+    expect(headYaw({ x: 0, y: 0 }, { x: -1, y: 0 }, { x: 1, y: 0 })).toBe(0);
+    expect(Math.abs(headYaw({ x: 0.6, y: 0 }, { x: -1, y: 0 }, { x: 1, y: 0 }))).toBeGreaterThan(0.35);
+  });
+
+  it('only shows a hint that persists, and only clears it once it is gone for a while', () => {
+    const q = new QualityMonitor(800, 500);
+    const dark = { luminance: 10 };
+    const fine = { luminance: 150 };
+    expect(q.update(dark, 0)).toBeNull();
+    expect(q.update(dark, 500)).toBeNull();
+    expect(q.update(dark, 800)).toBe('MORE_LIGHT');
+    expect(q.update(fine, 900)).toBe('MORE_LIGHT'); // not cleared yet
+    expect(q.update(dark, 1000)).toBe('MORE_LIGHT'); // a flicker back does not restart anything
+    expect(q.update(fine, 1100)).toBe('MORE_LIGHT');
+    expect(q.update(fine, 1600)).toBeNull();
   });
 });

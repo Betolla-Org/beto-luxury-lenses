@@ -1,6 +1,6 @@
 import { EyeIndices } from './landmarks';
 import { OneEuroFilter } from './filters';
-import { Point, getDistance, smoothClosedCurve } from './geometry';
+import { Point, clamp, getDistance, smoothClosedCurve } from './geometry';
 
 /**
  * Average human iris width relative to the eye opening (corner to corner),
@@ -122,34 +122,25 @@ export const measureContourEye = (contour: Point[]): EyeMeasurement | null => {
   };
 };
 
+const smoothstep = (edge0: number, edge1: number, x: number) => {
+  const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+};
+
 /**
- * Blink detector with hysteresis so the lens does not flicker around the threshold.
- * Uses the blendshape blink score when the tracker provides one, otherwise the lid-gap openness.
+ * How visible the lens should be (0-1) for how open the eye is, so it fades out and back in
+ * through a blink like a real lens disappearing under the lid, instead of switching off.
+ * Uses the blendshape blink score when the tracker gives one, otherwise the lid-gap openness.
  */
-export class BlinkDetector {
-  private closed = false;
+export const eyeVisibility = (m: Pick<EyeMeasurement, 'openness' | 'blink'>) =>
+  m.blink !== undefined
+    ? // Blendshape: about 0-0.3 open, up to ~0.5 looking down (barely dims), 0.75+ closed
+      1 - smoothstep(0.45, 0.75, m.blink)
+    : // Lid gap / eye width: roughly 0.25-0.35 open, under 0.14 closed
+      smoothstep(0.14, 0.22, m.openness);
 
-  constructor(
-    private readonly closeBelow = 0.16,
-    private readonly openAbove = 0.2,
-    // Blendshape score: about 0-0.3 open, up to ~0.5 when looking down, 0.7+ closed
-    private readonly blinkCloseAbove = 0.6,
-    private readonly blinkOpenBelow = 0.45
-  ) {}
-
-  update(openness: number, blink?: number): boolean {
-    if (blink !== undefined) {
-      if (this.closed && blink < this.blinkOpenBelow) this.closed = false;
-      else if (!this.closed && blink > this.blinkCloseAbove) this.closed = true;
-    } else if (this.closed && openness > this.openAbove) this.closed = false;
-    else if (!this.closed && openness < this.closeBelow) this.closed = true;
-    return this.closed;
-  }
-
-  reset() {
-    this.closed = false;
-  }
-}
+/** Below this visibility the eye counts as closed and no lens is drawn. */
+const MIN_VISIBILITY = 0.04;
 
 export interface EyeTrackerOptions {
   /** Lens diameter relative to the measured iris diameter. */
@@ -175,6 +166,8 @@ export interface EyeState {
   rotation: number;
   /** Eye opening to clip the lens to, lightly smoothed in time and rounded into a curve. */
   outline: Point[];
+  /** 0-1 multiplier on the lens opacity: fades during blinks and right after the face is lost. */
+  opacity: number;
 }
 
 // The iris ellipse: treat near-round as round (landmark jitter), and never squash past this
@@ -216,7 +209,6 @@ export class EyeTracker {
   private readonly fAspect = new OneEuroFilter(1, 0.01);
   private readonly fAngle = new OneEuroFilter(1, 0.05);
   private readonly outlineFilter = new OutlineFilter();
-  private readonly blink = new BlinkDetector();
   private readonly irisScale: number;
   private readonly outlineSubdivisions: number;
 
@@ -240,7 +232,8 @@ export class EyeTracker {
       this.reset();
       return null;
     }
-    if (this.blink.update(measurement.openness, measurement.blink)) return null;
+    const opacity = eyeVisibility(measurement);
+    if (opacity < MIN_VISIBILITY) return null;
 
     const diameter = sharedDiameter ?? this.fr.filter(trueIrisDiameter(measurement), timeMs);
     const radius = (diameter * this.irisScale * sizeAdjustment) / 2;
@@ -263,6 +256,7 @@ export class EyeTracker {
       radiusY: aspect > 1 ? radius / aspect : radius,
       rotation,
       outline: smoothClosedCurve(this.outlineFilter.filter(measurement.outline, timeMs), this.outlineSubdivisions),
+      opacity,
     };
   }
 
@@ -274,7 +268,6 @@ export class EyeTracker {
     this.fAspect.reset();
     this.fAngle.reset();
     this.outlineFilter.reset();
-    this.blink.reset();
   }
 }
 
@@ -282,6 +275,10 @@ export class EyeTracker {
 const OUTLIER_FRAMES = 5;
 /** A size reading this far (relative) from the smoothed size counts as a glitch. */
 const OUTLIER_RATIO = 0.25;
+/** How long the last lenses stay (fading out) after the face is lost: one dropped frame should not flash. */
+export const LOST_FACE_HOLD_MS = 150;
+
+type FaceState = { right: EyeState | null; left: EyeState | null };
 
 /**
  * Tracks both eyes of one face with a single shared iris size.
@@ -297,6 +294,8 @@ export class FaceTracker {
   private readonly size: OneEuroFilter;
   private smoothed: number | null = null;
   private outliers = 0;
+  private last: FaceState | null = null;
+  private lastSeenMs = 0;
 
   constructor(options: EyeTrackerOptions = {}) {
     this.right = new EyeTracker(options);
@@ -309,7 +308,7 @@ export class FaceTracker {
     left: EyeMeasurement | null,
     sizeAdjustment: number,
     timeMs: number
-  ): { right: EyeState | null; left: EyeState | null } {
+  ): FaceState {
     const readings = [right, left]
       .filter((m): m is EyeMeasurement => !!m)
       .map(trueIrisDiameter)
@@ -325,14 +324,33 @@ export class FaceTracker {
       }
     }
     const shared = this.smoothed ?? undefined;
-    return {
+    this.last = {
       right: this.right.update(right, sizeAdjustment, timeMs, shared),
       left: this.left.update(left, sizeAdjustment, timeMs, shared),
     };
+    this.lastSeenMs = timeMs;
+    return this.last;
   }
 
-  /** Call when the face is lost. */
+  /**
+   * Call on frames where no face was found. For `holdMs` the last lenses stay where they were,
+   * fading out, so a single missed detection does not flash them off; after that everything resets
+   * and the next lock snaps into place instead of gliding in.
+   */
+  lose(timeMs: number, holdMs = LOST_FACE_HOLD_MS): FaceState {
+    const elapsed = timeMs - this.lastSeenMs;
+    if (!this.last || elapsed > holdMs) {
+      this.reset();
+      return { right: null, left: null };
+    }
+    const fade = 1 - elapsed / holdMs;
+    const dim = (eye: EyeState | null) => eye && { ...eye, opacity: eye.opacity * fade };
+    return { right: dim(this.last.right), left: dim(this.last.left) };
+  }
+
+  /** Forget everything, e.g. when the camera restarts. */
   reset() {
+    this.last = null;
     this.right.reset();
     this.left.reset();
     this.size.reset();
