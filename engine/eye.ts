@@ -149,6 +149,10 @@ export interface EyeTrackerOptions {
   positionBeta?: number;
   radiusMinCutoff?: number;
   radiusBeta?: number;
+  /**
+   * Note: position is filtered in units of the iris radius, so `positionBeta` means the same at any
+   * face distance or screen density (speed is measured in iris radii per second).
+   */
   /** Points per outline segment when smoothing the eye opening into a curve (1 = keep the polygon). */
   outlineSubdivisions?: number;
 }
@@ -198,6 +202,12 @@ class OutlineFilter {
 export const trueIrisDiameter = (m: EyeMeasurement) =>
   m.irisShape ? Math.max(m.irisShape.width, m.irisShape.height) : m.irisDiameter;
 
+// Position smoothing, in iris radii (see EyeTrackerOptions). Tuned with `npm run eval`: against the
+// old pixel-unit filter (beta 0.01) this cut the lag while moving from 15% to 4% of the iris radius
+// with the same smoothing at rest.
+const POSITION_MIN_CUTOFF = 1.5;
+const POSITION_BETA = 6;
+
 /**
  * Turns per-frame eye measurements into a stable lens position, size and shape.
  * Returns null while the eye is closed or was not measured.
@@ -216,8 +226,8 @@ export class EyeTracker {
     // 1.0 = exactly the measured iris; anything bigger spills onto the white of the eye
     this.irisScale = options.irisScale ?? 1.0;
     this.outlineSubdivisions = options.outlineSubdivisions ?? 4;
-    this.fx = new OneEuroFilter(options.positionMinCutoff ?? 1.5, options.positionBeta ?? 0.01);
-    this.fy = new OneEuroFilter(options.positionMinCutoff ?? 1.5, options.positionBeta ?? 0.01);
+    this.fx = new OneEuroFilter(options.positionMinCutoff ?? POSITION_MIN_CUTOFF, options.positionBeta ?? POSITION_BETA);
+    this.fy = new OneEuroFilter(options.positionMinCutoff ?? POSITION_MIN_CUTOFF, options.positionBeta ?? POSITION_BETA);
     // Iris size barely changes, so smooth it much harder than position.
     this.fr = new OneEuroFilter(options.radiusMinCutoff ?? 0.5, options.radiusBeta ?? 0.001);
   }
@@ -237,6 +247,8 @@ export class EyeTracker {
 
     const diameter = sharedDiameter ?? this.fr.filter(trueIrisDiameter(measurement), timeMs);
     const radius = (diameter * this.irisScale * sizeAdjustment) / 2;
+    // Filter position in iris radii, so the filter behaves the same near or far and on any screen
+    const unit = Math.max(diameter / 2, 1);
 
     // aspect = width / height: under 1 the iris looks narrow (head turned), over 1 short (head tilted up/down)
     let aspect = 1;
@@ -249,8 +261,8 @@ export class EyeTracker {
     }
 
     return {
-      x: this.fx.filter(measurement.center.x, timeMs),
-      y: this.fy.filter(measurement.center.y, timeMs),
+      x: this.fx.filter(measurement.center.x / unit, timeMs) * unit,
+      y: this.fy.filter(measurement.center.y / unit, timeMs) * unit,
       radius,
       radiusX: aspect < 1 ? radius * aspect : radius,
       radiusY: aspect > 1 ? radius / aspect : radius,

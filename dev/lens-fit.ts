@@ -14,12 +14,25 @@ import {
 import { drawLens } from '../engine/web';
 import { createFaceLandmarker } from '../engine/face-landmarker';
 
-// Put face photos in dev/fixtures/ (gitignored) and list them here, or pick files on the page.
-const PHOTOS = ['./fixtures/burst-face.jpg', './fixtures/hero.jpg'];
+// Put face photos in dev/fixtures/ (gitignored) and list them here, pick files on the page, or pass
+// ?photos=<url>,<url> (what `npm run eval` does).
+const DEFAULT_PHOTOS = ['./fixtures/burst-face.jpg', './fixtures/hero.jpg'];
+const PHOTOS = new URLSearchParams(location.search).get('photos')?.split(',').filter(Boolean) ?? DEFAULT_PHOTOS;
 const COLOR = '#85A0AF';
 const OPACITY = 0.65;
 
 interface Result { old: number; next: number }
+
+/** What the live pipeline produced for one eye, in photo pixels (read by scripts/eval-engine.mjs). */
+interface EyeResult {
+  photo: string;
+  eye: 'right' | 'left';
+  /** MediaPipe's iris (landmarks only). */
+  landmark: { x: number; y: number; r: number };
+  /** After pixel refinement: center, ellipse semi-axes and rotation. */
+  live: { x: number; y: number; rx: number; ry: number; angle: number };
+  refined: boolean;
+}
 
 const loadImage = (src: string) =>
   new Promise<HTMLImageElement>((resolve, reject) => {
@@ -71,6 +84,8 @@ async function run(photos: string[]) {
   const out = document.getElementById('out')!;
   out.innerHTML = '';
   const results: Result[] = [];
+  const eyes: EyeResult[] = [];
+  const noFace: string[] = [];
 
   for (const [n, src] of photos.entries()) {
     status.textContent = `Analysing photo ${n + 1} of ${photos.length}…`;
@@ -88,6 +103,7 @@ async function run(photos: string[]) {
     out.append(section);
     if (!lm) {
       section.insertAdjacentHTML('beforeend', '<p class="old">No face found</p>');
+      noFace.push(src);
       continue;
     }
 
@@ -141,6 +157,13 @@ async function run(photos: string[]) {
         radiusY: shape.height / 2,
         rotation: shape.angle,
       });
+      eyes.push({
+        photo: src,
+        eye: eye === RIGHT_EYE ? 'right' : 'left',
+        landmark: iris,
+        live: { x: live.center.x, y: live.center.y, rx: shape.width / 2, ry: shape.height / 2, angle: shape.angle },
+        refined: !!refined,
+      });
       const moved = getDistance(live.center, m.center);
       const refineNote = refined
         ? `pixel refinement moved the center ${moved.toFixed(1)}px, ${refined.points.length} edge points`
@@ -161,7 +184,7 @@ async function run(photos: string[]) {
     ? `Average fit over ${results.length} eyes: old <b class="old">${avg('old').toFixed(0)}%</b> → new <b class="new">${avg('next').toFixed(0)}%</b>`
     : 'No eyes measured.';
   status.textContent = 'Done';
-  (window as any).__lensFit = { results, old: avg('old'), next: avg('next') };
+  (window as any).__lensFit = { results, old: avg('old'), next: avg('next'), eyes, noFace };
 }
 
 const start = (photos: string[]) =>

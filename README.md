@@ -31,6 +31,7 @@ The try-on screen needs camera access, which browsers only grant on `localhost` 
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm test` | Run the unit tests once |
 | `npm run check` | Typecheck, test and build (what CI runs) |
+| `npm run eval` | Engine eval in headless Chrome: lens fit, jitter and lag vs. the baseline (see below) |
 
 ## Project layout
 
@@ -86,6 +87,19 @@ Tuning knobs live in `EyeTrackerOptions` (`irisScale`, filter cutoffs), the cons
 ### Checking lens fit
 
 Run `npm run dev` and open http://localhost:3000/dev/lens-fit.html. It runs the real FaceLandmarker on face photos (put them in `dev/fixtures/`, which is gitignored, or pick files on the page) and shows the old engine, the new clipped lens, the live pipeline (pixel refinement, elliptical lens, smoothed outline, realistic mode) and the original photo side by side, with a fit score and how far the pixel refinement moved each iris.
+
+### Engine eval: fit, jitter and lag
+
+`npm run eval` checks the engine in a real (headless) browser and compares it with `dev/eval-baseline.json`:
+
+- **Lens fit:** runs the dev fit page on every photo and fails if the live pipeline moves a lens by more than 10% of the iris radius or resizes it by more than 10%.
+- **Jitter and lag:** turns the first photo with a face into two fake-camera videos with sensor-like noise, a still one and a slow circular pan, and runs the real try-on screen on them with `?trace` (which records every tracked frame in `window.__betoTrace`). Jitter is how much the lens shakes at rest; lag is how far the smoothed lens trails the raw measurement while moving, both as a percentage of the iris radius. It fails if either grows by more than 50%.
+
+When a change is intended, accept it with `npm run eval -- --update` and commit the new baseline. Details of the last run go to `dev/eval-report.json`.
+
+It needs Chrome (`CHROME_PATH`, or the usual install locations) and ffmpeg for the videos (`FFMPEG`, or on the PATH). Photos come from `EVAL_PHOTOS_DIR`, else `dev/eval-photos/`, else the gitignored `dev/fixtures/`. CI runs it on `dev/eval-photos/` and skips it while that folder is empty: commit face photos there that you have the rights to.
+
+The frame rate it prints comes from software rendering and says nothing about phones.
 
 ## Deployment
 

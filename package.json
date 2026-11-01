@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run typecheck && npm run test && npm run build"
+    "check": "npm run typecheck && npm run test && npm run build",
+    "eval": "node scripts/eval-engine.mjs"
   },
   "dependencies": {
     "@google/genai": "^1.38.0",
@@ -21,6 +22,7 @@
   "devDependencies": {
     "@types/node": "^22.14.0",
     "@vitejs/plugin-react": "^5.0.0",
+    "puppeteer-core": "25.14.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0",
     "vitest": "^3.2.7"

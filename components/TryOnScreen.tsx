@@ -36,6 +36,25 @@ const MAX_PIXEL_RATIO = 2;
 /** Longest side of a captured photo. */
 const MAX_CAPTURE_SIDE = 4096;
 
+/**
+ * With ?trace in the URL, every tracked frame is recorded in window.__betoTrace: the raw
+ * (refined, unsmoothed) iris and the lens drawn, per eye. scripts/eval-engine.mjs reads it to
+ * measure jitter and lag. Off by default, so it costs nothing.
+ */
+const TRACE = typeof location !== 'undefined' && new URLSearchParams(location.search).has('trace');
+const TRACE_LIMIT = 5000;
+type TracePoint = { x: number; y: number; r: number } | null;
+const recordTrace = (timeMs: number, raw: (EyeMeasurement | null)[], lens: (EyeState | null)[]) => {
+  const w = window as unknown as { __betoTrace?: { t: number; raw: TracePoint[]; lens: TracePoint[] }[] };
+  const trace = (w.__betoTrace ??= []);
+  if (trace.length >= TRACE_LIMIT) return;
+  trace.push({
+    t: timeMs,
+    raw: raw.map(m => m && { x: m.center.x, y: m.center.y, r: trueIrisDiameter(m) / 2 }),
+    lens: lens.map(e => e && { x: e.x, y: e.y, r: e.radius }),
+  });
+};
+
 /** What to tell the user when the shot hurts tracking (engine/quality.ts). */
 const HINTS: Record<QualityIssue, { icon: string; text: string }> = {
   MORE_LIGHT: { icon: 'light_mode', text: 'Find more light' },
@@ -277,6 +296,7 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
               : undefined,
       }, timeMs);
       setHint(issue);
+      if (TRACE) recordTrace(timeMs, [right, left], [eyes.right, eyes.left]);
       return [eyes.right, eyes.left];
   };
 
