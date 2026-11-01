@@ -1,13 +1,38 @@
 // Dev-only page (not part of the production build): npm run dev, then open /dev/lens-fit.html
-import { EyeIndices, LEFT_EYE, Point, RIGHT_EYE, getDistance, lensFitScore, measureMediaPipeEye } from '../engine';
+import {
+  EyeIndices,
+  LEFT_EYE,
+  Point,
+  RIGHT_EYE,
+  applyIrisRefinement,
+  getDistance,
+  lensFitScore,
+  measureMediaPipeEye,
+  refineIris,
+  smoothClosedCurve,
+} from '../engine';
 import { drawLens } from '../engine/web';
+import { createFaceLandmarker } from '../engine/face-landmarker';
 
-// Put face photos in dev/fixtures/ (gitignored) and list them here, or pick files on the page.
-const PHOTOS = ['./fixtures/burst-face.jpg', './fixtures/hero.jpg'];
+// Put face photos in dev/fixtures/ (gitignored) and list them here, pick files on the page, or pass
+// ?photos=<url>,<url> (what `npm run eval` does).
+const DEFAULT_PHOTOS = ['./fixtures/burst-face.jpg', './fixtures/hero.jpg'];
+const PHOTOS = new URLSearchParams(location.search).get('photos')?.split(',').filter(Boolean) ?? DEFAULT_PHOTOS;
 const COLOR = '#85A0AF';
 const OPACITY = 0.65;
 
 interface Result { old: number; next: number }
+
+/** What the live pipeline produced for one eye, in photo pixels (read by scripts/eval-engine.mjs). */
+interface EyeResult {
+  photo: string;
+  eye: 'right' | 'left';
+  /** MediaPipe's iris (landmarks only). */
+  landmark: { x: number; y: number; r: number };
+  /** After pixel refinement: center, ellipse semi-axes and rotation. */
+  live: { x: number; y: number; rx: number; ry: number; angle: number };
+  refined: boolean;
+}
 
 const loadImage = (src: string) =>
   new Promise<HTMLImageElement>((resolve, reject) => {
@@ -18,18 +43,9 @@ const loadImage = (src: string) =>
     img.src = src;
   });
 
-const createFaceMesh = () => {
-  const faceMesh = new window.FaceMesh({
-    locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${file}`,
-  });
-  faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, staticImageMode: true, minDetectionConfidence: 0.5 });
-  let resolveNext: (lm: Point[] | null) => void = () => {};
-  faceMesh.onResults((results: any) => resolveNext(results.multiFaceLandmarks?.[0] ?? null));
-  return async (img: HTMLImageElement) => {
-    const done = new Promise<Point[] | null>(r => (resolveNext = r));
-    await faceMesh.send({ image: img });
-    return done;
-  };
+const createDetector = () => {
+  const landmarker = createFaceLandmarker('IMAGE');
+  return async (img: HTMLImageElement): Promise<Point[] | null> => (await landmarker).detect(img).faceLandmarks[0] ?? null;
 };
 
 /** The engine before this change: center from landmark 468 only, 1.15x the iris, no eyelid clipping. */
@@ -55,13 +71,21 @@ const figure = (canvas: HTMLCanvasElement, caption: string) => {
   return f;
 };
 
-const detect = createFaceMesh();
+/** The whole photo as a pixel patch for refineIris. */
+const pickPatch = (canvas: HTMLCanvasElement) => {
+  const image = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height);
+  return { data: image.data, width: image.width, height: image.height, x: 0, y: 0 };
+};
+
+const detect = createDetector();
 
 async function run(photos: string[]) {
   const status = document.getElementById('status')!;
   const out = document.getElementById('out')!;
   out.innerHTML = '';
   const results: Result[] = [];
+  const eyes: EyeResult[] = [];
+  const noFace: string[] = [];
 
   for (const [n, src] of photos.entries()) {
     status.textContent = `Analysing photo ${n + 1} of ${photos.length}…`;
@@ -79,6 +103,7 @@ async function run(photos: string[]) {
     out.append(section);
     if (!lm) {
       section.insertAdjacentHTML('beforeend', '<p class="old">No face found</p>');
+      noFace.push(src);
       continue;
     }
 
@@ -116,18 +141,39 @@ async function run(photos: string[]) {
       actx.drawImage(base, 0, 0);
       drawLens(actx, iris.x, iris.y, iris.r, COLOR, { opacity: OPACITY, clip: m.outline });
 
+      // The live pipeline: pixel-refined iris, elliptical lens, outline rounded into a curve
+      const refined = refineIris(pickPatch(base), iris, m.outline);
+      const live = applyIrisRefinement(m, refined);
+      const shape = live.irisShape!;
       const real = document.createElement('canvas');
       real.width = W;
       real.height = H;
       const rctx = real.getContext('2d')!;
       rctx.drawImage(base, 0, 0);
-      drawLens(rctx, iris.x, iris.y, iris.r, COLOR, { opacity: OPACITY, clip: m.outline, realistic: true });
+      drawLens(rctx, live.center.x, live.center.y, shape.width / 2, COLOR, {
+        opacity: OPACITY,
+        clip: smoothClosedCurve(m.outline),
+        realistic: true,
+        radiusY: shape.height / 2,
+        rotation: shape.angle,
+      });
+      eyes.push({
+        photo: src,
+        eye: eye === RIGHT_EYE ? 'right' : 'left',
+        landmark: iris,
+        live: { x: live.center.x, y: live.center.y, rx: shape.width / 2, ry: shape.height / 2, angle: shape.angle },
+        refined: !!refined,
+      });
+      const moved = getDistance(live.center, m.center);
+      const refineNote = refined
+        ? `pixel refinement moved the center ${moved.toFixed(1)}px, ${refined.points.length} edge points`
+        : 'pixel refinement found no clear edge (landmarks kept)';
 
       const half = iris.r * 3.2;
       rows.append(
         figure(crop(before, m.center, half), `${name} · <span class="old">old engine: ${(score.old * 100).toFixed(0)}% fit</span>`),
         figure(crop(after, m.center, half), `${name} · <span class="new">new, clipped: ${(score.next * 100).toFixed(0)}% fit</span>`),
-        figure(crop(real, m.center, half), `${name} · <span class="new">new, realistic mode</span>`),
+        figure(crop(real, m.center, half), `${name} · <span class="new">live pipeline (realistic)</span> · ${refineNote}`),
         figure(crop(base, m.center, half), `${name} · original photo`)
       );
     }
@@ -138,7 +184,7 @@ async function run(photos: string[]) {
     ? `Average fit over ${results.length} eyes: old <b class="old">${avg('old').toFixed(0)}%</b> → new <b class="new">${avg('next').toFixed(0)}%</b>`
     : 'No eyes measured.';
   status.textContent = 'Done';
-  (window as any).__lensFit = { results, old: avg('old'), next: avg('next') };
+  (window as any).__lensFit = { results, old: avg('old'), next: avg('next'), eyes, noFace };
 }
 
 const start = (photos: string[]) =>

@@ -1,7 +1,24 @@
+import { readFileSync } from 'fs';
 import { describe, expect, it } from 'vitest';
+import { TASKS_VISION_VERSION } from './mediapipe-assets';
 import {
-  BlinkDetector,
+  EyeMeasurement,
+  LOST_FACE_HOLD_MS,
+  QualityMonitor,
+  eyeVisibility,
+  headYaw,
+  lensLighting,
+  meanLuminance,
+  qualityIssues,
   EyeTracker,
+  FaceTracker,
+  applyIrisRefinement,
+  axisAngle,
+  fitCircle,
+  refineIris,
+  smoothClosedCurve,
+  LEFT_EYE,
+  blendshapeScores,
   IRIS_TO_EYE_WIDTH,
   OneEuroFilter,
   Point,
@@ -91,12 +108,39 @@ describe('blink detection', () => {
     expect(near).toBeCloseTo(far);
   });
 
-  it('uses hysteresis between closing and reopening', () => {
-    const b = new BlinkDetector(0.16, 0.2);
-    expect(b.update(0.3)).toBe(false);
-    expect(b.update(0.1)).toBe(true);
-    expect(b.update(0.18)).toBe(true); // still closed inside the band
-    expect(b.update(0.25)).toBe(false);
+  it('fades the lens out as the lids close (lid gap)', () => {
+    expect(eyeVisibility({ openness: 0.3 })).toBe(1);
+    expect(eyeVisibility({ openness: 0.1 })).toBe(0);
+    const half = eyeVisibility({ openness: 0.18 });
+    expect(half).toBeGreaterThan(0.2);
+    expect(half).toBeLessThan(0.8);
+  });
+
+  it('prefers the blendshape blink score over the lid gap when given', () => {
+    // Lid gap says closed (e.g. looking down), blendshape says open: stays visible
+    expect(eyeVisibility({ openness: 0.1, blink: 0.3 })).toBe(1);
+    // Looking down raises the score to ~0.5: barely dims
+    expect(eyeVisibility({ openness: 0.3, blink: 0.5 })).toBeGreaterThan(0.9);
+    expect(eyeVisibility({ openness: 0.3, blink: 0.85 })).toBe(0);
+  });
+});
+
+describe('blendshapes', () => {
+  it('builds a name -> score lookup', () => {
+    expect(blendshapeScores([{ categoryName: 'eyeBlinkLeft', score: 0.7 }])).toEqual({ eyeBlinkLeft: 0.7 });
+    expect(blendshapeScores(undefined)).toEqual({});
+  });
+
+  it('maps each eye to its own blink blendshape', () => {
+    expect(RIGHT_EYE.blinkBlendshape).toBe('eyeBlinkRight');
+    expect(LEFT_EYE.blinkBlendshape).toBe('eyeBlinkLeft');
+  });
+});
+
+describe('MediaPipe assets', () => {
+  it('loads the WASM runtime from the same version as the npm package', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
+    expect(pkg.dependencies['@mediapipe/tasks-vision']).toBe(TASKS_VISION_VERSION);
   });
 });
 
@@ -180,15 +224,228 @@ describe('EyeTracker', () => {
   it('places the lens on the iris, sizes it to the iris and carries the eye outline', () => {
     const eye = new EyeTracker().update(measure(buildFace(10)), 1.2, 0)!;
     expect({ x: eye.x, y: eye.y, radius: eye.radius }).toEqual({ x: 50, y: 50, radius: 6 });
-    expect(eye.outline).toHaveLength(RIGHT_EYE.outline.length);
+    // The outline is rounded into a curve: 4 points per original segment by default
+    expect(eye.outline).toHaveLength(RIGHT_EYE.outline.length * 4);
   });
 
   it('hides the lens while the eye is closed', () => {
     expect(new EyeTracker().update(measure(buildFace(1)), 1, 0)).toBeNull();
   });
 
+  it('uses the blendshape blink score from FaceLandmarker', () => {
+    const scores = (blink: number) => ({ eyeBlinkRight: blink, eyeBlinkLeft: 0 });
+    const lm = buildFace(10);
+    expect(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.9))!.blink).toBe(0.9);
+    expect(new EyeTracker().update(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.9)), 1, 0)).toBeNull();
+    expect(new EyeTracker().update(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.1)), 1, 0)!.opacity).toBe(1);
+    const fading = new EyeTracker().update(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.6)), 1, 0)!;
+    expect(fading.opacity).toBeGreaterThan(0);
+    expect(fading.opacity).toBeLessThan(1);
+  });
+
   it('returns null when landmarks are missing', () => {
     expect(measure([])).toBeNull();
     expect(new EyeTracker().update(null, 1, 0)).toBeNull();
+  });
+});
+
+describe('smoothClosedCurve', () => {
+  it('passes through the original points and adds points between them', () => {
+    const square = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
+    const curve = smoothClosedCurve(square, 4);
+    expect(curve).toHaveLength(16);
+    expect(curve[0]).toEqual({ x: 0, y: 0 });
+    expect(curve[4]).toEqual({ x: 10, y: 0 });
+  });
+
+  it('leaves tiny polygons alone', () => {
+    const line = [{ x: 0, y: 0 }, { x: 1, y: 1 }];
+    expect(smoothClosedCurve(line)).toBe(line);
+  });
+});
+
+describe('iris ellipse', () => {
+  const eye = (width: number, height: number, angle = 0): EyeMeasurement => ({
+    center: { x: 50, y: 50 },
+    irisDiameter: (width + height) / 2,
+    openness: 0.3,
+    outline: [{ x: 30, y: 50 }, { x: 50, y: 40 }, { x: 70, y: 50 }, { x: 50, y: 60 }],
+    irisShape: { width, height, angle },
+  });
+
+  it('folds axis angles so left-to-right and right-to-left mean the same', () => {
+    expect(axisAngle(Math.PI)).toBeCloseTo(0);
+    expect(axisAngle(Math.PI + 0.1)).toBeCloseTo(0.1);
+    expect(axisAngle(-0.1)).toBeCloseTo(-0.1);
+  });
+
+  it('becomes an ellipse when the iris looks narrow, sized by its larger axis', () => {
+    const state = new EyeTracker().update(eye(7, 10, 0.2), 1, 0)!;
+    expect(state.radius).toBeCloseTo(5);
+    expect(state.radiusY).toBeCloseTo(5);
+    expect(state.radiusX).toBeCloseTo(3.5);
+    expect(state.rotation).toBeCloseTo(0.2);
+  });
+
+  it('stays round for small aspect jitter', () => {
+    const state = new EyeTracker().update(eye(9.7, 10), 1, 0)!;
+    expect(state.radiusX).toBe(state.radiusY);
+  });
+});
+
+describe('FaceTracker', () => {
+  const eye = (diameter: number): EyeMeasurement => ({
+    center: { x: 50, y: 50 },
+    irisDiameter: diameter,
+    openness: 0.3,
+    outline: [{ x: 30, y: 50 }, { x: 50, y: 40 }, { x: 70, y: 50 }, { x: 50, y: 60 }],
+  });
+
+  it('gives both eyes the same size: the average of the two readings', () => {
+    const { right, left } = new FaceTracker().update(eye(10), eye(12), 1, 0);
+    expect(right!.radius).toBeCloseTo(5.5);
+    expect(left!.radius).toBeCloseTo(5.5);
+  });
+
+  it('lets one open eye carry the size while the other is not measured', () => {
+    const { right, left } = new FaceTracker().update(eye(10), null, 1, 0);
+    expect(right!.radius).toBeCloseTo(5);
+    expect(left).toBeNull();
+  });
+
+  it('ignores a one-frame size glitch but follows a change that persists', () => {
+    const face = new FaceTracker();
+    face.update(eye(10), eye(10), 1, 0);
+    expect(face.update(eye(20), eye(20), 1, 33).right!.radius).toBeCloseTo(5); // glitch: ignored
+    let r = 0;
+    for (let i = 2; i <= 6; i++) r = face.update(eye(20), eye(20), 1, i * 33).right!.radius;
+    expect(r).toBeCloseTo(10); // persisted for 5 frames: snapped to
+  });
+});
+
+describe('iris pixel refinement', () => {
+  // A synthetic eye: bright sclera, dark iris (r = 14) and darker pupil, centered at (50, 50)
+  const W = 100;
+  const H = 100;
+  const makeEye = (iris: { x: number; y: number; r: number } | null) => {
+    const data = new Uint8ClampedArray(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const d = iris ? Math.hypot(x + 0.5 - iris.x, y + 0.5 - iris.y) : Infinity;
+        const v = d < 5 ? 20 : iris && d < iris.r ? 70 : 210;
+        const i = (y * W + x) * 4;
+        data[i] = data[i + 1] = data[i + 2] = v;
+        data[i + 3] = 255;
+      }
+    }
+    return { data, width: W, height: H, x: 0, y: 0 };
+  };
+  const outline = Array.from({ length: 32 }, (_, k) => {
+    const a = (k / 32) * Math.PI * 2;
+    return { x: 50 + 40 * Math.cos(a), y: 50 + 18 * Math.sin(a) };
+  });
+
+  it('fits a circle exactly to points on a circle', () => {
+    const points = Array.from({ length: 12 }, (_, k) => ({ x: 3 + 7 * Math.cos(k), y: -2 + 7 * Math.sin(k) }));
+    const c = fitCircle(points)!;
+    expect(c.x).toBeCloseTo(3);
+    expect(c.y).toBeCloseTo(-2);
+    expect(c.r).toBeCloseTo(7);
+  });
+
+  it('pulls an off-center, undersized landmark estimate onto the real iris edge', () => {
+    const refined = refineIris(makeEye({ x: 50, y: 50, r: 14 }), { x: 52, y: 49, r: 12 }, outline)!;
+    expect(refined).not.toBeNull();
+    expect(refined.x).toBeCloseTo(50, 0);
+    expect(refined.y).toBeCloseTo(50, 0);
+    expect(refined.r).toBeCloseTo(14, 0);
+  });
+
+  it('gives up when there is no iris edge to find', () => {
+    expect(refineIris(makeEye(null), { x: 50, y: 50, r: 12 }, outline)).toBeNull();
+  });
+
+  it('moves the center toward the fit, and the size only while the iris looks round', () => {
+    const base = {
+      center: { x: 52, y: 49 },
+      irisDiameter: 24,
+      openness: 0.3,
+      outline,
+    };
+    const round = applyIrisRefinement({ ...base, irisShape: { width: 24, height: 24, angle: 0 } }, { x: 50, y: 50, r: 14 }, 1);
+    expect(round.center).toEqual({ x: 50, y: 50 });
+    expect(round.irisShape!.width).toBeCloseTo(28);
+
+    const turned = applyIrisRefinement({ ...base, irisShape: { width: 16, height: 24, angle: 0 } }, { x: 50, y: 50, r: 14 }, 1);
+    expect(turned.center).toEqual({ x: 50, y: 50 });
+    expect(turned.irisShape!.width).toBe(16);
+    expect(applyIrisRefinement(base, null)).toBe(base);
+  });
+});
+
+describe('lost face hold', () => {
+  const eye = (): EyeMeasurement => ({
+    center: { x: 50, y: 50 },
+    irisDiameter: 10,
+    openness: 0.3,
+    outline: [{ x: 30, y: 50 }, { x: 50, y: 40 }, { x: 70, y: 50 }, { x: 50, y: 60 }],
+  });
+
+  it('keeps the last lenses briefly, fading, then lets go', () => {
+    const face = new FaceTracker();
+    face.update(eye(), eye(), 1, 1000);
+    const held = face.lose(1000 + LOST_FACE_HOLD_MS / 2);
+    expect(held.right!.x).toBe(50);
+    expect(held.right!.opacity).toBeCloseTo(0.5);
+    expect(face.lose(1000 + LOST_FACE_HOLD_MS + 1)).toEqual({ right: null, left: null });
+  });
+
+  it('holds nothing before any face was seen', () => {
+    expect(new FaceTracker().lose(0)).toEqual({ right: null, left: null });
+  });
+});
+
+describe('lighting', () => {
+  const flat = (v: number) => {
+    const data = new Uint8ClampedArray(10 * 10 * 4).fill(v);
+    return { data, width: 10, height: 10, x: 0, y: 0 };
+  };
+
+  it('measures mean luminance', () => {
+    expect(meanLuminance(flat(100))).toBeCloseTo(100);
+  });
+
+  it('widens the pupil and tones the lens down in dim light', () => {
+    const dim = lensLighting(20);
+    const bright = lensLighting(200);
+    expect(dim.pupilRatio).toBeGreaterThan(bright.pupilRatio);
+    expect(dim.cover).toBeLessThan(bright.cover);
+    expect(dim.glare).toBeLessThan(bright.glare);
+  });
+});
+
+describe('quality hints', () => {
+  it('orders issues by importance', () => {
+    expect(qualityIssues({ luminance: 20, irisPixels: 8, yaw: 0.5 })).toEqual(['MORE_LIGHT', 'MOVE_CLOSER', 'FACE_CAMERA']);
+    expect(qualityIssues({ luminance: 120, irisPixels: 30, yaw: 0 })).toEqual([]);
+    expect(qualityIssues({ faceCropped: true })).toEqual(['MOVE_BACK']);
+  });
+
+  it('measures head yaw from the nose and cheeks', () => {
+    expect(headYaw({ x: 0, y: 0 }, { x: -1, y: 0 }, { x: 1, y: 0 })).toBe(0);
+    expect(Math.abs(headYaw({ x: 0.6, y: 0 }, { x: -1, y: 0 }, { x: 1, y: 0 }))).toBeGreaterThan(0.35);
+  });
+
+  it('only shows a hint that persists, and only clears it once it is gone for a while', () => {
+    const q = new QualityMonitor(800, 500);
+    const dark = { luminance: 10 };
+    const fine = { luminance: 150 };
+    expect(q.update(dark, 0)).toBeNull();
+    expect(q.update(dark, 500)).toBeNull();
+    expect(q.update(dark, 800)).toBe('MORE_LIGHT');
+    expect(q.update(fine, 900)).toBe('MORE_LIGHT'); // not cleared yet
+    expect(q.update(dark, 1000)).toBe('MORE_LIGHT'); // a flicker back does not restart anything
+    expect(q.update(fine, 1100)).toBe('MORE_LIGHT');
+    expect(q.update(fine, 1600)).toBeNull();
   });
 });

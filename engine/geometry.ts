@@ -28,6 +28,31 @@ export const pointInPolygon = (p: Point, polygon: Point[]) => {
 export const clamp =(value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
 /**
+ * Smooths a closed polygon into a curve through all its points (uniform Catmull-Rom), adding `subdivisions - 1` points between each pair. Turns a 16-point eye
+ * outline into a round lid edge instead of visible straight segments.
+ */
+export const smoothClosedCurve = (points: Point[], subdivisions = 4): Point[] => {
+  const n = points.length;
+  if (n < 3 || subdivisions < 2) return points;
+  const out: Point[] = [];
+  for (let i = 0; i < n; i++) {
+    const p0 = points[(i - 1 + n) % n];
+    const p1 = points[i];
+    const p2 = points[(i + 1) % n];
+    const p3 = points[(i + 2) % n];
+    for (let s = 0; s < subdivisions; s++) {
+      const t = s / subdivisions;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      const at = (a: number, b: number, c: number, d: number) =>
+        0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+      out.push({ x: at(p0.x, p1.x, p2.x, p3.x), y: at(p0.y, p1.y, p2.y, p3.y) });
+    }
+  }
+  return out;
+};
+
+/**
  * Where a source of `srcW x srcH` lands inside a `dstW x dstH` box under `object-fit: cover`.
  * The rect extends past the box (negative x or y) on the cropped axis.
  */

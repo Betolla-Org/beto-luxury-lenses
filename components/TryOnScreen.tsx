@@ -3,7 +3,20 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Lens } from '../types';
 import { LENSES } from '../constants';
 import {
-  EyeTracker,
+  EyeMeasurement,
+  EyeState,
+  FaceTracker,
+  OneEuroFilter,
+  QUALITY_LANDMARKS,
+  QualityIssue,
+  QualityMonitor,
+  applyIrisRefinement,
+  blendshapeScores,
+  headYaw,
+  lensLighting,
+  meanLuminance,
+  refineIris,
+  trueIrisDiameter,
   LEFT_EYE,
   RIGHT_EYE,
   Point,
@@ -12,12 +25,43 @@ import {
   mapLandmark,
   measureMediaPipeEye,
 } from '../engine';
-import { addWatermark, drawLens, shareImage } from '../engine/web';
+import { DetectedFrame, FaceDetector, addWatermark, createFaceDetector, drawLens, onVideoFrames, shareImage, tuneCamera } from '../engine/web';
 
 // --- CONFIGURATION ---
 const LENS_OPACITY = 0.65; // 35% transparent (65% opaque) so color shows properly
 const MIN_SIZE = 0.8;
 const MAX_SIZE = 1.3;
+/** Canvas pixels per CSS pixel: sharp on high-density screens, capped so phones keep their frame rate. */
+const MAX_PIXEL_RATIO = 2;
+/** Longest side of a captured photo. */
+const MAX_CAPTURE_SIDE = 4096;
+
+/**
+ * With ?trace in the URL, every tracked frame is recorded in window.__betoTrace: the raw
+ * (refined, unsmoothed) iris and the lens drawn, per eye. scripts/eval-engine.mjs reads it to
+ * measure jitter and lag. Off by default, so it costs nothing.
+ */
+const TRACE = typeof location !== 'undefined' && new URLSearchParams(location.search).has('trace');
+const TRACE_LIMIT = 5000;
+type TracePoint = { x: number; y: number; r: number } | null;
+const recordTrace = (timeMs: number, raw: (EyeMeasurement | null)[], lens: (EyeState | null)[]) => {
+  const w = window as unknown as { __betoTrace?: { t: number; raw: TracePoint[]; lens: TracePoint[] }[] };
+  const trace = (w.__betoTrace ??= []);
+  if (trace.length >= TRACE_LIMIT) return;
+  trace.push({
+    t: timeMs,
+    raw: raw.map(m => m && { x: m.center.x, y: m.center.y, r: trueIrisDiameter(m) / 2 }),
+    lens: lens.map(e => e && { x: e.x, y: e.y, r: e.radius }),
+  });
+};
+
+/** What to tell the user when the shot hurts tracking (engine/quality.ts). */
+const HINTS: Record<QualityIssue, { icon: string; text: string }> = {
+  MORE_LIGHT: { icon: 'light_mode', text: 'Find more light' },
+  MOVE_CLOSER: { icon: 'zoom_in', text: 'Move a little closer' },
+  MOVE_BACK: { icon: 'zoom_out', text: 'Move back a little' },
+  FACE_CAMERA: { icon: 'face', text: 'Face the camera' },
+};
 
 interface TryOnScreenProps {
   lens: Lens;
@@ -31,6 +75,7 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
   const currentLensRef = useRef(initialLens); // Ref to hold the latest lens for the animation loop
   const [cameraState, setCameraState] = useState<'LOADING' | 'READY' | 'ERROR' | 'PERMISSION_DENIED'>('LOADING');
   const [trackingStatus, setTrackingStatus] = useState<'SEARCHING' | 'LOCKED'>('SEARCHING');
+  const [hint, setHint] = useState<QualityIssue | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [generatedImage, setGeneratedImage] = useState<string | null>(null);
   const [sizeAdjustment, setSizeAdjustment] = useState(1.0);
@@ -47,17 +92,17 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
   const canvasRef = useRef<HTMLCanvasElement>(null);
   
   // Logic Refs
-  const requestRef = useRef<number>(0);
-  const faceMeshRef = useRef<any>(null);
-  const cameraUtilsRef = useRef<any>(null);
-  const activeRef = useRef(true);
-  const landmarksRef = useRef<any>(null);
+  // FaceLandmarker needs strictly increasing timestamps
+  const lastDetectTimeRef = useRef(0);
+  // Set by the shutter; the next rendered frame is then also rendered at full camera resolution
+  const captureRequestedRef = useRef(false);
 
-  // Per-eye smoothing + blink state, kept outside React so the render loop never re-renders
-  const eyeTrackers = useRef({
-    right: new EyeTracker(),
-    left: new EyeTracker(),
-  });
+  // Smoothing, shared iris size and blink state for both eyes, kept outside React so the render loop never re-renders
+  const faceTracker = useRef(new FaceTracker());
+  // Light around the eyes, smoothed over seconds: drives the lens pupil, glare and cover (engine/lighting.ts)
+  const luminanceFilter = useRef(new OneEuroFilter(0.3, 0));
+  const lightingRef = useRef(lensLighting(128));
+  const qualityMonitor = useRef(new QualityMonitor());
   // The render loop is started once, so it reads the size through a ref, not the stale state
   const sizeAdjustmentRef = useRef(sizeAdjustment);
   useEffect(() => {
@@ -70,76 +115,75 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
 
   // --- INITIALIZATION ---
   useEffect(() => {
-    activeRef.current = true;
+    // Local, not a ref: under StrictMode the first mount's async setup must see its own cancellation
+    let cancelled = false;
+    let stream: MediaStream | null = null;
+    let detector: FaceDetector | null = null;
+    let stopFrames: (() => void) | null = null;
 
     const startApp = async () => {
-      if (!window.FaceMesh || !videoRef.current || !canvasRef.current || !containerRef.current) {
+      const video = videoRef.current;
+      if (!video || !navigator.mediaDevices?.getUserMedia) {
         setCameraState('ERROR');
         return;
       }
-      
-      const canvas = canvasRef.current;
-      canvas.width = containerRef.current.clientWidth;
-      canvas.height = containerRef.current.clientHeight;
 
-      const faceMesh = new window.FaceMesh({ 
-        locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` 
-      });
-      
-      faceMesh.setOptions({
-        maxNumFaces: 1,
-        refineLandmarks: true,
-        minDetectionConfidence: 0.6,
-        minTrackingConfidence: 0.6
-      });
-
-      faceMesh.onResults((results: any) => {
-        // setState with an unchanged string is a no-op, so this only re-renders on a status change
-        if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
-          landmarksRef.current = results.multiFaceLandmarks[0];
-          setTrackingStatus('LOCKED');
-        } else {
-          landmarksRef.current = null;
-          eyeTrackers.current.right.reset();
-          eyeTrackers.current.left.reset();
-          setTrackingStatus('SEARCHING');
-        }
-      });
-      faceMeshRef.current = faceMesh;
-
-      const camera = new window.Camera(videoRef.current, {
-        onFrame: async () => {
-          if (activeRef.current && videoRef.current && faceMeshRef.current) {
-            await faceMeshRef.current.send({ image: videoRef.current });
-          }
-        },
-        width: 1280,
-        height: 720,
-        facingMode: 'user'
-      });
+      // Load the model (in a worker when possible) while the user answers the camera prompt
+      const detectorPromise = createFaceDetector();
+      detectorPromise.then(d => (cancelled ? d.close() : (detector = d)), () => {});
 
       try {
-        await camera.start();
-        setCameraState('READY');
-        startRenderLoop();
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          // 1080p where the camera has it: more pixels across the iris and sharper photos
+          video: { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+        });
+        if (cancelled) return;
+        video.srcObject = stream;
+        await video.play();
+        const settings = await tuneCamera(stream.getVideoTracks()[0]);
+        console.info('Camera:', settings.width, 'x', settings.height, '@', settings.frameRate, 'fps');
       } catch (e: any) {
-        console.error("Camera Error:", e);
-        if (e.name === 'NotAllowedError' || e.message?.includes('Permission denied')) {
-          setCameraState('PERMISSION_DENIED');
-        } else {
+        if (cancelled) return;
+        console.error('Camera Error:', e);
+        setCameraState(e?.name === 'NotAllowedError' ? 'PERMISSION_DENIED' : 'ERROR');
+        return;
+      }
+
+      let ready: FaceDetector;
+      try {
+        ready = await detectorPromise;
+      } catch (e) {
+        if (!cancelled) {
+          console.error('Face tracking failed to load:', e);
           setCameraState('ERROR');
         }
+        return;
       }
-      cameraUtilsRef.current = camera;
+      if (cancelled) return;
+      console.info('Face tracking runs on the', ready.mode);
+      setCameraState('READY');
+      stopFrames = onVideoFrames(video, timeMs => {
+        const detectTime = Math.max(timeMs, lastDetectTimeRef.current + 1);
+        lastDetectTimeRef.current = detectTime;
+        ready.detect(video, detectTime).then(frame => {
+          if (!frame) return; // still busy with an earlier frame: skipped
+          try {
+            if (!cancelled) renderFrame(frame, detectTime);
+          } finally {
+            frame.release();
+          }
+        }, e => console.error('Face detection failed:', e));
+      });
     };
 
     startApp();
 
     return () => {
-      activeRef.current = false;
-      cancelAnimationFrame(requestRef.current);
-      if (cameraUtilsRef.current) cameraUtilsRef.current.stop();
-      if (faceMeshRef.current) faceMeshRef.current.close();
+      cancelled = true;
+      stopFrames?.();
+      stream?.getTracks().forEach(track => track.stop());
+      detector?.close();
     };
   }, []);
 
@@ -165,10 +209,9 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
     setCountdown(3);
   };
 
+  // The photo is taken from the next frame the render loop draws (see captureAtFullResolution)
   const captureFrame = () => {
-    if (!canvasRef.current) return;
-    const dataUrl = canvasRef.current.toDataURL('image/jpeg', 0.95);
-    addWatermark(dataUrl, currentLens.name).then(final => setGeneratedImage(final));
+    captureRequestedRef.current = true;
   };
 
   const handleShare = () => {
@@ -176,54 +219,165 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
   };
 
   // --- RENDER LOOP ---
-  const drawLenses = (ctx: CanvasRenderingContext2D, landmarks: Point[], vW: number, vH: number, canvasW: number, canvasH: number) => {
-      const project = (lm: Point) => mapLandmark(lm, vW, vH, canvasW, canvasH);
-      const now = performance.now();
-      const color = currentLensRef.current.color;
+  /**
+   * Sharpens the landmark measurements with the frame's own pixels: finds each iris edge
+   * (engine/iris.ts), and measures the light around the eyes. Must run after the video frame
+   * is drawn and before any lens is. Reads one pixel block covering both eyes, because every
+   * canvas readback stalls the GPU.
+   */
+  const readPixels = (ctx: CanvasRenderingContext2D, eyes: (EyeMeasurement | null)[]) => {
+    const found = eyes.filter((m): m is EyeMeasurement => !!m);
+    if (!found.length) return { eyes };
+    const reach = (m: EyeMeasurement) => Math.ceil(m.irisDiameter * 0.8) + 2;
+    const x0 = Math.max(0, Math.floor(Math.min(...found.map(m => m.center.x - reach(m)))));
+    const y0 = Math.max(0, Math.floor(Math.min(...found.map(m => m.center.y - reach(m)))));
+    const x1 = Math.min(ctx.canvas.width, Math.ceil(Math.max(...found.map(m => m.center.x + reach(m)))));
+    const y1 = Math.min(ctx.canvas.height, Math.ceil(Math.max(...found.map(m => m.center.y + reach(m)))));
+    if (x1 - x0 < 8 || y1 - y0 < 8) return { eyes };
+    const image = ctx.getImageData(x0, y0, x1 - x0, y1 - y0);
+    const patch = { data: image.data, width: image.width, height: image.height, x: x0, y: y0 };
+    return {
+      eyes: eyes.map(m => m && applyIrisRefinement(m, refineIris(patch, { x: m.center.x, y: m.center.y, r: m.irisDiameter / 2 }, m.outline))),
+      luminance: meanLuminance(patch),
+    };
+  };
 
-      const eyes = [
-          { tracker: eyeTrackers.current.right, indices: RIGHT_EYE },
-          { tracker: eyeTrackers.current.left, indices: LEFT_EYE },
-      ];
-      for (const { tracker, indices } of eyes) {
-          const eye = tracker.update(measureMediaPipeEye(landmarks, indices, project), sizeAdjustmentRef.current, now);
-          if (eye) drawLens(ctx, eye.x, eye.y, eye.radius, color, { opacity: LENS_OPACITY, clip: eye.outline, realistic: true });
+  const paintLenses = (ctx: CanvasRenderingContext2D, eyes: (EyeState | null)[]) => {
+      const color = currentLensRef.current.color;
+      const light = lightingRef.current;
+      for (const eye of eyes) {
+          if (!eye) continue;
+          drawLens(ctx, eye.x, eye.y, eye.radiusX, color, {
+              opacity: LENS_OPACITY * eye.opacity,
+              clip: eye.outline,
+              realistic: true,
+              radiusY: eye.radiusY,
+              rotation: eye.rotation,
+              pupilRatio: light.pupilRatio,
+              glare: light.glare,
+              cover: light.cover,
+          });
       }
   };
 
-  const startRenderLoop = () => {
-    const render = () => {
-      if (!activeRef.current || !canvasRef.current || !videoRef.current || !containerRef.current) return;
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
-      const video = videoRef.current;
-      const vW = video.videoWidth;
-      const vH = video.videoHeight;
-      if (!ctx || video.readyState < 2 || !vW || !vH) {
-          requestRef.current = requestAnimationFrame(render);
-          return;
+  const trackFace = (
+    ctx: CanvasRenderingContext2D,
+    landmarks: Point[],
+    blendshapes: Record<string, number>,
+    timeMs: number,
+    vW: number, vH: number, canvasW: number, canvasH: number
+  ) => {
+      const project = (lm: Point) => mapLandmark(lm, vW, vH, canvasW, canvasH);
+
+      // Measure both eyes before painting anything, so the pixel reads only see the camera image
+      const pixels = readPixels(ctx, [
+          measureMediaPipeEye(landmarks, RIGHT_EYE, project, blendshapes),
+          measureMediaPipeEye(landmarks, LEFT_EYE, project, blendshapes),
+      ]);
+      const [right, left] = pixels.eyes;
+      if (pixels.luminance !== undefined) {
+          lightingRef.current = lensLighting(luminanceFilter.current.filter(pixels.luminance, timeMs));
       }
+      const eyes = faceTracker.current.update(right, left, sizeAdjustmentRef.current, timeMs);
 
-      // Resizing a canvas reallocates its buffer, so only do it when the container actually changed
-      const canvasW = containerRef.current.clientWidth;
-      const canvasH = containerRef.current.clientHeight;
-      if (canvas.width !== canvasW) canvas.width = canvasW;
-      if (canvas.height !== canvasH) canvas.height = canvasH;
+      // Hints: enough light and iris detail, whole face in view, facing the camera?
+      const measured = [right, left].filter((m): m is EyeMeasurement => !!m);
+      const canvasPerVideoPixel = coverRect(vW, vH, canvasW, canvasH).width / vW;
+      const { noseTip, cheekRight, cheekLeft, forehead, chin } = QUALITY_LANDMARKS;
+      const outside = (p: Point) => p.x < 0 || p.y < 0 || p.x > canvasW || p.y > canvasH;
+      const issue = qualityMonitor.current.update({
+          luminance: pixels.luminance,
+          irisPixels: measured.length
+              ? measured.reduce((sum, m) => sum + trueIrisDiameter(m), 0) / measured.length / canvasPerVideoPixel
+              : undefined,
+          faceCropped: [cheekRight, cheekLeft, forehead, chin].some(i => landmarks[i] && outside(project(landmarks[i]))),
+          yaw: landmarks[noseTip] && landmarks[cheekRight] && landmarks[cheekLeft]
+              ? headYaw(landmarks[noseTip], landmarks[cheekRight], landmarks[cheekLeft])
+              : undefined,
+      }, timeMs);
+      setHint(issue);
+      if (TRACE) recordTrace(timeMs, [right, left], [eyes.right, eyes.left]);
+      return [eyes.right, eyes.left];
+  };
 
-      const draw = coverRect(vW, vH, canvasW, canvasH);
-      ctx.save();
-      ctx.translate(canvasW, 0);
-      ctx.scale(-1, 1);
-      ctx.drawImage(video, draw.x, draw.y, draw.width, draw.height);
-      ctx.restore();
+  /**
+   * Renders the frame again at the camera's own resolution (when that is sharper than the screen
+   * canvas) with the same lenses, and turns it into the watermarked photo.
+   */
+  const captureAtFullResolution = (frame: DetectedFrame, eyes: (EyeState | null)[], canvasW: number, canvasH: number) => {
+    const canvasPerVideoPixel = coverRect(frame.width, frame.height, canvasW, canvasH).width / frame.width;
+    const scale = Math.min(Math.max(1, 1 / canvasPerVideoPixel), MAX_CAPTURE_SIDE / Math.max(canvasW, canvasH));
+    const photo = document.createElement('canvas');
+    photo.width = Math.round(canvasW * scale);
+    photo.height = Math.round(canvasH * scale);
+    const ctx = photo.getContext('2d');
+    if (!ctx) return;
+    drawMirrored(ctx, frame, photo.width, photo.height);
+    // Scale the lens geometry rather than the context, so the lens is painted at full detail too
+    paintLenses(ctx, eyes.map(eye => eye && {
+      ...eye,
+      x: eye.x * scale,
+      y: eye.y * scale,
+      radius: eye.radius * scale,
+      radiusX: eye.radiusX * scale,
+      radiusY: eye.radiusY * scale,
+      outline: eye.outline.map(p => ({ x: p.x * scale, y: p.y * scale })),
+    }));
+    const name = currentLensRef.current.name;
+    addWatermark(photo.toDataURL('image/jpeg', 0.95), name).then(final => setGeneratedImage(final));
+  };
 
-      if (landmarksRef.current) {
-        drawLenses(ctx, landmarksRef.current, vW, vH, canvasW, canvasH);
+  /** Draws the frame mirrored (selfie view) with object-fit: cover into a w x h canvas. */
+  const drawMirrored = (ctx: CanvasRenderingContext2D, frame: DetectedFrame, w: number, h: number) => {
+    const draw = coverRect(frame.width, frame.height, w, h);
+    ctx.save();
+    ctx.translate(w, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(frame.image, draw.x, draw.y, draw.width, draw.height);
+    ctx.restore();
+  };
+
+  /**
+   * Draws one detected frame: the exact image the face was found in, then its lenses, so the
+   * lens can never trail the eye, and the trackers get exactly one sample per detection.
+   */
+  const renderFrame = (frame: DetectedFrame, timeMs: number) => {
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (!canvas || !container || !ctx || !frame.width || !frame.height) return;
+
+    // Canvas pixels follow the screen's pixel density (capped). Resizing reallocates the buffer,
+    // so only do it when the size actually changed.
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
+    const canvasW = Math.round(container.clientWidth * pixelRatio);
+    const canvasH = Math.round(container.clientHeight * pixelRatio);
+    if (canvas.width !== canvasW) canvas.width = canvasW;
+    if (canvas.height !== canvasH) canvas.height = canvasH;
+
+    drawMirrored(ctx, frame, canvasW, canvasH);
+
+    // setState with an unchanged string is a no-op, so this only re-renders on a status change
+    let eyes: (EyeState | null)[];
+    if (frame.landmarks) {
+      setTrackingStatus('LOCKED');
+      eyes = trackFace(ctx, frame.landmarks, blendshapeScores(frame.blendshapes), timeMs, frame.width, frame.height, canvasW, canvasH);
+    } else {
+      // Keep the last lenses briefly (fading) so one missed detection does not flash them off
+      const held = faceTracker.current.lose(timeMs);
+      eyes = [held.right, held.left];
+      if (!held.right && !held.left) {
+        qualityMonitor.current.reset();
+        setHint(null);
+        setTrackingStatus('SEARCHING');
       }
+    }
+    paintLenses(ctx, eyes);
 
-      requestRef.current = requestAnimationFrame(render);
-    };
-    render();
+    if (captureRequestedRef.current) {
+      captureRequestedRef.current = false;
+      captureAtFullResolution(frame, eyes, canvasW, canvasH);
+    }
   };
 
   return (
@@ -291,6 +445,12 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
                 <div className={`w-2 h-2 rounded-full ${trackingStatus === 'LOCKED' ? 'bg-green-500' : 'bg-red-500 animate-pulse'}`}></div>
                 <p className="text-white/50 text-[10px] uppercase">{trackingStatus === 'LOCKED' ? 'LIVE TRACKING' : 'SEARCHING...'}</p>
             </div>
+            {hint && trackingStatus === 'LOCKED' && (
+                <div role="status" className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-black/50 backdrop-blur border border-luxury-gold/40 px-3 py-1 text-luxury-gold text-[11px] font-bold tracking-wider">
+                    <span className="material-symbols-outlined text-[14px] leading-none">{HINTS[hint].icon}</span>
+                    {HINTS[hint].text}
+                </div>
+            )}
         </div>
         <div className="w-10 h-10"></div>
       </div>

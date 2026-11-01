@@ -17,6 +17,9 @@
     "../engine/*.test.ts",
     "../engine/web.ts",
     "../engine/lens-renderer.ts",
-    "../engine/capture.ts"
+    "../engine/capture.ts",
+    "../engine/face-landmarker.ts",
+    "../engine/face-detector.ts",
+    "../engine/face-worker.ts"
   ]
 }

@@ -23,6 +23,34 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  # Lens fit, jitter and lag in a real browser against dev/eval-baseline.json (scripts/eval-engine.mjs).
+  # Needs face photos you have the rights to in dev/eval-photos/; skipped until there are some.
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Engine eval
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+          EVAL_PHOTOS_DIR: dev/eval-photos
+        run: |
+          if ls dev/eval-photos/*.jpg dev/eval-photos/*.jpeg dev/eval-photos/*.png dev/eval-photos/*.webp >/dev/null 2>&1; then
+            npm run eval
+          else
+            echo "::notice::No photos in dev/eval-photos: engine eval skipped"
+          fi
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: dev/eval-report.json
+          if-no-files-found: ignore
+
   mobile:
     runs-on: ubuntu-latest
     defaults:
