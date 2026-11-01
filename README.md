@@ -53,7 +53,9 @@ engine/              AR helpers shared by web and mobile (unit tested)
   lens-style.ts      The lens look (colors, ring, pupil, glare) used by both renderers
   fit.ts             Lens fit score: overlap of painted lens vs visible iris
   web.ts             Browser-only exports:
-  face-landmarker.ts   creates FaceLandmarker (GPU, CPU fallback) and the per-video-frame loop
+  face-detector.ts     face detection in a Web Worker (main-thread fallback), per-frame loop, camera tuning
+  face-worker.ts       the worker: runs FaceLandmarker on each frame and sends the frame back
+  face-landmarker.ts   creates FaceLandmarker (GPU, CPU fallback); used by the worker, the fallback and dev/
   mediapipe-assets.ts  pinned WASM and model URLs
   lens-renderer.ts     draws the lens on a canvas (clipped, realistic blending)
   capture.ts           watermarking, share sheet and download fallback
@@ -63,8 +65,9 @@ dev/lens-fit.html    Dev-only page: old vs new lens fit on face photos
 
 ### How the try-on engine works
 
-1. `onVideoFrames` (`requestVideoFrameCallback`, with a `requestAnimationFrame` fallback) fires once per new camera frame. FaceLandmarker runs on that frame and returns 478 normalized landmarks plus blendshapes, and the same frame is then drawn, so the lens never trails the eye and the smoothing filters get exactly one sample per detection.
-2. The mirrored video is drawn with `object-fit: cover` math (`coverRect`), and landmarks are mapped through the same rect so lenses line up with the eyes.
+1. The camera is asked for 1080p at 30 fps, with continuous focus, exposure and white balance where supported (`tuneCamera`).
+   `onVideoFrames` (`requestVideoFrameCallback`, with a `requestAnimationFrame` fallback) fires once per new camera frame. The frame is copied to an `ImageBitmap` and sent to a Web Worker running FaceLandmarker, which returns it with 478 normalized landmarks plus blendshapes; frames arriving while it is busy are skipped, never queued. The returned frame is what gets drawn, so the lens never trails the eye, the smoothing filters get exactly one sample per detection, and detection never blocks the UI. Without worker support it falls back to the main thread.
+2. The mirrored frame is drawn with `object-fit: cover` math (`coverRect`) onto a canvas sized to the screen's pixel density (capped at 2x), and landmarks are mapped through the same rect so lenses line up with the eyes.
 3. `measureMediaPipeEye` reads the iris (center averaged over 5 points, width and height from its edge points, and the angle of its left-right axis) and the eye-opening outline.
 4. `refineIris` reads one pixel block around both eyes from the frame just drawn, casts rays sideways from each iris center (the lids cover the top and bottom), finds the dark-to-light step where the iris meets the white of the eye, and fits a circle to those points with outlier rejection. `applyIrisRefinement` moves the center 70% of the way to that fit, and the size too while the iris looks round. With weak evidence it keeps the landmarks.
 5. `FaceTracker` gives both eyes one shared iris size (average of both readings, one-frame glitches ignored) and runs one `EyeTracker` per eye, which fades the lens out and back in through a blink (`eyeVisibility`: the `eyeBlink` blendshape, or lid gap / eye width when no blendshapes are available, as on mobile), smooths position and size with One Euro filters, turns the iris width/height ratio into an elliptical lens when the head turns, follows head roll, and rounds the 16-point eye outline into a smooth curve.
@@ -73,6 +76,8 @@ dev/lens-fit.html    Dev-only page: old vs new lens fit on face photos
 7. The same pixel block gives the light level around the eyes, smoothed over seconds: `lensLighting` widens the pupil and tones down the glare and painted cover in dim light, so a light lens does not glow in a dark room.
 8. `QualityMonitor` turns light, iris size in camera pixels, framing and head yaw into one hint at a time ("Find more light", "Move a little closer", "Move back a little", "Face the camera"), shown only once an issue lasts 0.8 s and cleared after 0.5 s without it.
 9. When a frame has no face, `FaceTracker.lose` keeps the last lenses for 150 ms, fading, so one missed detection does not flash them off; after that it resets so the next lock snaps into place.
+
+10. The shutter flags the next frame: it is rendered once more at the camera's own resolution when that is sharper than the screen canvas (same lenses, scaled geometry), then watermarked. The watermark scales with the photo.
 
 There is no latency prediction: each lens is drawn on the very frame it was measured on, so predicting ahead would push it past the eye.
 

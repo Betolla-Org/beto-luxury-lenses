@@ -11,7 +11,8 @@ import {
   refineIris,
   smoothClosedCurve,
 } from '../engine';
-import { createFaceLandmarker, drawLens } from '../engine/web';
+import { drawLens } from '../engine/web';
+import { createFaceLandmarker } from '../engine/face-landmarker';
 
 // Put face photos in dev/fixtures/ (gitignored) and list them here, or pick files on the page.
 const PHOTOS = ['./fixtures/burst-face.jpg', './fixtures/hero.jpg'];

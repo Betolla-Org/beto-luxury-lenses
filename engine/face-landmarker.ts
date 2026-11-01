@@ -8,12 +8,17 @@ const MIN_CONFIDENCE = 0.6;
 /**
  * Creates a MediaPipe FaceLandmarker for one face, with blendshapes (used for blink detection).
  * Tries the GPU first and falls back to the CPU on devices without usable WebGL.
+ * Works on the main thread and in a Web Worker (see ./face-worker.ts).
  *
- * - 'VIDEO': call `detectForVideo(video, timestampMs)` once per video frame, timestamps strictly increasing.
+ * - 'VIDEO': call `detectForVideo(frame, timestampMs)` once per video frame, timestamps strictly increasing.
  * - 'IMAGE': call `detect(image)` on still photos.
  */
-export const createFaceLandmarker = async (runningMode: 'VIDEO' | 'IMAGE' = 'VIDEO'): Promise<FaceLandmarker> => {
-  const fileset = await FilesetResolver.forVisionTasks(TASKS_VISION_WASM_URL);
+export const createFaceLandmarker = async (
+  runningMode: 'VIDEO' | 'IMAGE' = 'VIDEO',
+  { inModuleWorker = false } = {}
+): Promise<FaceLandmarker> => {
+  // A module worker cannot run the classic WASM loader script; MediaPipe ships an ES module build of it
+  const fileset = await FilesetResolver.forVisionTasks(TASKS_VISION_WASM_URL, inModuleWorker);
   const create = (delegate: 'GPU' | 'CPU') =>
     FaceLandmarker.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: FACE_LANDMARKER_MODEL_URL, delegate },
@@ -31,44 +36,4 @@ export const createFaceLandmarker = async (runningMode: 'VIDEO' | 'IMAGE' = 'VID
     console.warn('FaceLandmarker: GPU delegate unavailable, falling back to CPU', e);
     return create('CPU');
   }
-};
-
-/**
- * Calls `callback` once for every new frame the video presents, so detection and drawing
- * both work on that exact frame. Uses requestVideoFrameCallback where available, otherwise
- * requestAnimationFrame and skips ticks where the frame has not changed.
- * Returns a function that stops the loop.
- */
-export const onVideoFrames = (video: HTMLVideoElement, callback: (timeMs: number) => void): (() => void) => {
-  let stopped = false;
-
-  if (typeof video.requestVideoFrameCallback === 'function') {
-    let handle = 0;
-    const tick = (now: number) => {
-      if (stopped) return;
-      callback(now);
-      handle = video.requestVideoFrameCallback(tick);
-    };
-    handle = video.requestVideoFrameCallback(tick);
-    return () => {
-      stopped = true;
-      video.cancelVideoFrameCallback(handle);
-    };
-  }
-
-  let handle = 0;
-  let lastFrameTime = -1;
-  const tick = (now: number) => {
-    if (stopped) return;
-    if (video.readyState >= 2 && video.currentTime !== lastFrameTime) {
-      lastFrameTime = video.currentTime;
-      callback(now);
-    }
-    handle = requestAnimationFrame(tick);
-  };
-  handle = requestAnimationFrame(tick);
-  return () => {
-    stopped = true;
-    cancelAnimationFrame(handle);
-  };
 };

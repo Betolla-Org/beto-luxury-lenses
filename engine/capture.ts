@@ -14,30 +14,37 @@ export const addWatermark = (imgUrl: string, lensName: string): Promise<string> 
 
       ctx.drawImage(img, 0, 0);
 
-      const gradient = ctx.createLinearGradient(0, canvas.height - 300, 0, canvas.height);
+      // Laid out for a 400px-wide photo and scaled to the real width, so it looks the same at any resolution
+      const k = canvas.width / 400;
+      const px = (n: number) => n * k;
+      const band = px(300);
+
+      const gradient = ctx.createLinearGradient(0, canvas.height - band, 0, canvas.height);
       gradient.addColorStop(0, 'transparent');
       gradient.addColorStop(1, 'rgba(0,0,0,0.8)');
       ctx.fillStyle = gradient;
-      ctx.fillRect(0, canvas.height - 300, canvas.width, 300);
+      ctx.fillRect(0, canvas.height - band, canvas.width, band);
 
       const centerX = canvas.width / 2;
       ctx.shadowColor = 'rgba(212, 175, 55, 0.5)';
-      ctx.shadowBlur = 15;
-      ctx.font = "900 60px 'Playfair Display'";
+      ctx.shadowBlur = px(15);
+      ctx.font = `900 ${px(60)}px 'Playfair Display'`;
       ctx.fillStyle = '#D4AF37';
       ctx.textAlign = 'center';
-      ctx.fillText('BETO', centerX, canvas.height - 140);
+      ctx.fillText('BETO', centerX, canvas.height - px(140));
 
       ctx.shadowBlur = 0;
-      ctx.font = "500 24px 'Manrope'";
+      ctx.font = `500 ${px(24)}px 'Manrope'`;
       ctx.fillStyle = '#FFFFFF';
-      ctx.letterSpacing = '3px';
-      ctx.fillText(lensName.toUpperCase(), centerX, canvas.height - 90);
+      ctx.letterSpacing = `${px(3)}px`;
+      ctx.fillText(lensName.toUpperCase(), centerX, canvas.height - px(90));
 
-      ctx.font = "300 18px 'Manrope'";
+      ctx.font = `300 ${px(18)}px 'Manrope'`;
       ctx.fillStyle = '#D4AF37';
       ctx.letterSpacing = '0px';
-      ctx.fillText('نتيجة لون العدسة على العين مطابقة بنسبة ٨٥٪ إلى ٩٠٪', centerX, canvas.height - 55);
+      // A detached canvas lays text out left-to-right, which put the Arabic line's final "٪" at its start
+      ctx.direction = 'rtl';
+      ctx.fillText('نتيجة لون العدسة على العين مطابقة بنسبة ٨٥٪ إلى ٩٠٪', centerX, canvas.height - px(55));
 
       resolve(canvas.toDataURL('image/jpeg', 0.9));
     };

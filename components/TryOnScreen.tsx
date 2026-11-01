@@ -25,12 +25,16 @@ import {
   mapLandmark,
   measureMediaPipeEye,
 } from '../engine';
-import { FaceLandmarker, addWatermark, createFaceLandmarker, drawLens, onVideoFrames, shareImage } from '../engine/web';
+import { DetectedFrame, FaceDetector, addWatermark, createFaceDetector, drawLens, onVideoFrames, shareImage, tuneCamera } from '../engine/web';
 
 // --- CONFIGURATION ---
 const LENS_OPACITY = 0.65; // 35% transparent (65% opaque) so color shows properly
 const MIN_SIZE = 0.8;
 const MAX_SIZE = 1.3;
+/** Canvas pixels per CSS pixel: sharp on high-density screens, capped so phones keep their frame rate. */
+const MAX_PIXEL_RATIO = 2;
+/** Longest side of a captured photo. */
+const MAX_CAPTURE_SIDE = 4096;
 
 /** What to tell the user when the shot hurts tracking (engine/quality.ts). */
 const HINTS: Record<QualityIssue, { icon: string; text: string }> = {
@@ -71,6 +75,8 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
   // Logic Refs
   // FaceLandmarker needs strictly increasing timestamps
   const lastDetectTimeRef = useRef(0);
+  // Set by the shutter; the next rendered frame is then also rendered at full camera resolution
+  const captureRequestedRef = useRef(false);
 
   // Smoothing, shared iris size and blink state for both eyes, kept outside React so the render loop never re-renders
   const faceTracker = useRef(new FaceTracker());
@@ -93,7 +99,7 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
     // Local, not a ref: under StrictMode the first mount's async setup must see its own cancellation
     let cancelled = false;
     let stream: MediaStream | null = null;
-    let landmarker: FaceLandmarker | null = null;
+    let detector: FaceDetector | null = null;
     let stopFrames: (() => void) | null = null;
 
     const startApp = async () => {
@@ -103,18 +109,21 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
         return;
       }
 
-      // Load the model while the user answers the camera prompt
-      const landmarkerPromise = createFaceLandmarker('VIDEO');
-      landmarkerPromise.then(l => (cancelled ? l.close() : (landmarker = l)), () => {});
+      // Load the model (in a worker when possible) while the user answers the camera prompt
+      const detectorPromise = createFaceDetector();
+      detectorPromise.then(d => (cancelled ? d.close() : (detector = d)), () => {});
 
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
-          video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+          // 1080p where the camera has it: more pixels across the iris and sharper photos
+          video: { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
         });
         if (cancelled) return;
         video.srcObject = stream;
         await video.play();
+        const settings = await tuneCamera(stream.getVideoTracks()[0]);
+        console.info('Camera:', settings.width, 'x', settings.height, '@', settings.frameRate, 'fps');
       } catch (e: any) {
         if (cancelled) return;
         console.error('Camera Error:', e);
@@ -122,9 +131,9 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
         return;
       }
 
-      let ready: FaceLandmarker;
+      let ready: FaceDetector;
       try {
-        ready = await landmarkerPromise;
+        ready = await detectorPromise;
       } catch (e) {
         if (!cancelled) {
           console.error('Face tracking failed to load:', e);
@@ -133,8 +142,20 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
         return;
       }
       if (cancelled) return;
+      console.info('Face tracking runs on the', ready.mode);
       setCameraState('READY');
-      stopFrames = onVideoFrames(video, timeMs => renderFrame(ready, timeMs));
+      stopFrames = onVideoFrames(video, timeMs => {
+        const detectTime = Math.max(timeMs, lastDetectTimeRef.current + 1);
+        lastDetectTimeRef.current = detectTime;
+        ready.detect(video, detectTime).then(frame => {
+          if (!frame) return; // still busy with an earlier frame: skipped
+          try {
+            if (!cancelled) renderFrame(frame, detectTime);
+          } finally {
+            frame.release();
+          }
+        }, e => console.error('Face detection failed:', e));
+      });
     };
 
     startApp();
@@ -143,7 +164,7 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
       cancelled = true;
       stopFrames?.();
       stream?.getTracks().forEach(track => track.stop());
-      landmarker?.close();
+      detector?.close();
     };
   }, []);
 
@@ -169,10 +190,9 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
     setCountdown(3);
   };
 
+  // The photo is taken from the next frame the render loop draws (see captureAtFullResolution)
   const captureFrame = () => {
-    if (!canvasRef.current) return;
-    const dataUrl = canvasRef.current.toDataURL('image/jpeg', 0.95);
-    addWatermark(dataUrl, currentLens.name).then(final => setGeneratedImage(final));
+    captureRequestedRef.current = true;
   };
 
   const handleShare = () => {
@@ -240,7 +260,6 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
           lightingRef.current = lensLighting(luminanceFilter.current.filter(pixels.luminance, timeMs));
       }
       const eyes = faceTracker.current.update(right, left, sizeAdjustmentRef.current, timeMs);
-      paintLenses(ctx, [eyes.right, eyes.left]);
 
       // Hints: enough light and iris detail, whole face in view, facing the camera?
       const measured = [right, left].filter((m): m is EyeMeasurement => !!m);
@@ -258,59 +277,86 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
               : undefined,
       }, timeMs);
       setHint(issue);
+      return [eyes.right, eyes.left];
   };
 
   /**
-   * Runs once per new camera frame: detect on the frame, then draw that same frame and its lenses.
-   * The lens can never trail the eye, and the trackers get exactly one sample per detection.
+   * Renders the frame again at the camera's own resolution (when that is sharper than the screen
+   * canvas) with the same lenses, and turns it into the watermarked photo.
    */
-  const renderFrame = (landmarker: FaceLandmarker, timeMs: number) => {
+  const captureAtFullResolution = (frame: DetectedFrame, eyes: (EyeState | null)[], canvasW: number, canvasH: number) => {
+    const canvasPerVideoPixel = coverRect(frame.width, frame.height, canvasW, canvasH).width / frame.width;
+    const scale = Math.min(Math.max(1, 1 / canvasPerVideoPixel), MAX_CAPTURE_SIDE / Math.max(canvasW, canvasH));
+    const photo = document.createElement('canvas');
+    photo.width = Math.round(canvasW * scale);
+    photo.height = Math.round(canvasH * scale);
+    const ctx = photo.getContext('2d');
+    if (!ctx) return;
+    drawMirrored(ctx, frame, photo.width, photo.height);
+    // Scale the lens geometry rather than the context, so the lens is painted at full detail too
+    paintLenses(ctx, eyes.map(eye => eye && {
+      ...eye,
+      x: eye.x * scale,
+      y: eye.y * scale,
+      radius: eye.radius * scale,
+      radiusX: eye.radiusX * scale,
+      radiusY: eye.radiusY * scale,
+      outline: eye.outline.map(p => ({ x: p.x * scale, y: p.y * scale })),
+    }));
+    const name = currentLensRef.current.name;
+    addWatermark(photo.toDataURL('image/jpeg', 0.95), name).then(final => setGeneratedImage(final));
+  };
+
+  /** Draws the frame mirrored (selfie view) with object-fit: cover into a w x h canvas. */
+  const drawMirrored = (ctx: CanvasRenderingContext2D, frame: DetectedFrame, w: number, h: number) => {
+    const draw = coverRect(frame.width, frame.height, w, h);
+    ctx.save();
+    ctx.translate(w, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(frame.image, draw.x, draw.y, draw.width, draw.height);
+    ctx.restore();
+  };
+
+  /**
+   * Draws one detected frame: the exact image the face was found in, then its lenses, so the
+   * lens can never trail the eye, and the trackers get exactly one sample per detection.
+   */
+  const renderFrame = (frame: DetectedFrame, timeMs: number) => {
     const canvas = canvasRef.current;
-    const video = videoRef.current;
     const container = containerRef.current;
     const ctx = canvas?.getContext('2d');
-    if (!canvas || !video || !container || !ctx) return;
-    const vW = video.videoWidth;
-    const vH = video.videoHeight;
-    if (!vW || !vH) return;
+    if (!canvas || !container || !ctx || !frame.width || !frame.height) return;
 
-    // Resizing a canvas reallocates its buffer, so only do it when the container actually changed
-    const canvasW = container.clientWidth;
-    const canvasH = container.clientHeight;
+    // Canvas pixels follow the screen's pixel density (capped). Resizing reallocates the buffer,
+    // so only do it when the size actually changed.
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
+    const canvasW = Math.round(container.clientWidth * pixelRatio);
+    const canvasH = Math.round(container.clientHeight * pixelRatio);
     if (canvas.width !== canvasW) canvas.width = canvasW;
     if (canvas.height !== canvasH) canvas.height = canvasH;
 
-    const detectTime = Math.max(timeMs, lastDetectTimeRef.current + 1);
-    lastDetectTimeRef.current = detectTime;
-    let result;
-    try {
-      result = landmarker.detectForVideo(video, detectTime);
-    } catch (e) {
-      console.error('Face detection failed on this frame:', e);
-    }
-
-    const draw = coverRect(vW, vH, canvasW, canvasH);
-    ctx.save();
-    ctx.translate(canvasW, 0);
-    ctx.scale(-1, 1);
-    ctx.drawImage(video, draw.x, draw.y, draw.width, draw.height);
-    ctx.restore();
+    drawMirrored(ctx, frame, canvasW, canvasH);
 
     // setState with an unchanged string is a no-op, so this only re-renders on a status change
-    const face = result?.faceLandmarks[0];
-    if (face) {
+    let eyes: (EyeState | null)[];
+    if (frame.landmarks) {
       setTrackingStatus('LOCKED');
-      const blendshapes = blendshapeScores(result?.faceBlendshapes[0]?.categories);
-      trackFace(ctx, face, blendshapes, detectTime, vW, vH, canvasW, canvasH);
+      eyes = trackFace(ctx, frame.landmarks, blendshapeScores(frame.blendshapes), timeMs, frame.width, frame.height, canvasW, canvasH);
     } else {
       // Keep the last lenses briefly (fading) so one missed detection does not flash them off
-      const held = faceTracker.current.lose(detectTime);
-      paintLenses(ctx, [held.right, held.left]);
+      const held = faceTracker.current.lose(timeMs);
+      eyes = [held.right, held.left];
       if (!held.right && !held.left) {
         qualityMonitor.current.reset();
         setHint(null);
         setTrackingStatus('SEARCHING');
       }
+    }
+    paintLenses(ctx, eyes);
+
+    if (captureRequestedRef.current) {
+      captureRequestedRef.current = false;
+      captureAtFullResolution(frame, eyes, canvasW, canvasH);
     }
   };
 
