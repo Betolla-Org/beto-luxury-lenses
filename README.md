@@ -59,6 +59,10 @@ engine/              Framework-free AR helpers (unit tested)
 
 Tuning knobs live in `EyeTrackerOptions` (`irisScale`, filter cutoffs) and `LENS_OPACITY` in `TryOnScreen.tsx`.
 
+## Deployment
+
+Hosted on Netlify. [netlify.toml](netlify.toml) sets the build (`npm run build` → `dist`, Node 22), the SPA fallback, and headers (camera allowed for this origin only, long caching for `/assets`). Netlify serves over HTTPS, which the camera requires.
+
 ## Contributing
 
 Work on a branch and open a pull request against `main`. CI runs `typecheck`, `test` and `build` on every PR.
