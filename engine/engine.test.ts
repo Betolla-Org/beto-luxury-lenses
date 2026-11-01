@@ -1,7 +1,11 @@
+import { readFileSync } from 'fs';
 import { describe, expect, it } from 'vitest';
+import { TASKS_VISION_VERSION } from './mediapipe-assets';
 import {
   BlinkDetector,
   EyeTracker,
+  LEFT_EYE,
+  blendshapeScores,
   IRIS_TO_EYE_WIDTH,
   OneEuroFilter,
   Point,
@@ -98,6 +102,34 @@ describe('blink detection', () => {
     expect(b.update(0.18)).toBe(true); // still closed inside the band
     expect(b.update(0.25)).toBe(false);
   });
+
+  it('prefers the blendshape blink score over the lid gap when given', () => {
+    const b = new BlinkDetector();
+    // Lid gap says closed (e.g. looking down), blendshape says open: stays open
+    expect(b.update(0.1, 0.3)).toBe(false);
+    expect(b.update(0.3, 0.8)).toBe(true);
+    expect(b.update(0.3, 0.5)).toBe(true); // still closed inside the band
+    expect(b.update(0.3, 0.2)).toBe(false);
+  });
+});
+
+describe('blendshapes', () => {
+  it('builds a name -> score lookup', () => {
+    expect(blendshapeScores([{ categoryName: 'eyeBlinkLeft', score: 0.7 }])).toEqual({ eyeBlinkLeft: 0.7 });
+    expect(blendshapeScores(undefined)).toEqual({});
+  });
+
+  it('maps each eye to its own blink blendshape', () => {
+    expect(RIGHT_EYE.blinkBlendshape).toBe('eyeBlinkRight');
+    expect(LEFT_EYE.blinkBlendshape).toBe('eyeBlinkLeft');
+  });
+});
+
+describe('MediaPipe assets', () => {
+  it('loads the WASM runtime from the same version as the npm package', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
+    expect(pkg.dependencies['@mediapipe/tasks-vision']).toBe(TASKS_VISION_VERSION);
+  });
 });
 
 describe('lensFitScore', () => {
@@ -185,6 +217,14 @@ describe('EyeTracker', () => {
 
   it('hides the lens while the eye is closed', () => {
     expect(new EyeTracker().update(measure(buildFace(1)), 1, 0)).toBeNull();
+  });
+
+  it('uses the blendshape blink score from FaceLandmarker', () => {
+    const scores = (blink: number) => ({ eyeBlinkRight: blink, eyeBlinkLeft: 0 });
+    const lm = buildFace(10);
+    expect(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.9))!.blink).toBe(0.9);
+    expect(new EyeTracker().update(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.9)), 1, 0)).toBeNull();
+    expect(new EyeTracker().update(measureMediaPipeEye(lm, RIGHT_EYE, identity, scores(0.1)), 1, 0)).not.toBeNull();
   });
 
   it('returns null when landmarks are missing', () => {

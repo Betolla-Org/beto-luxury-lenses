@@ -19,10 +19,3 @@ export interface Collection {
 }
 
 export type AppView = 'SPLASH' | 'HOME' | 'TRY_ON' | 'COLLECTION' | 'PROFILE' | 'DASHBOARD';
-
-declare global {
-  interface Window {
-    FaceMesh: any;
-    Camera: any;
-  }
-}

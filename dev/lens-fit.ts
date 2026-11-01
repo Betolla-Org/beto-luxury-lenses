@@ -1,6 +1,6 @@
 // Dev-only page (not part of the production build): npm run dev, then open /dev/lens-fit.html
 import { EyeIndices, LEFT_EYE, Point, RIGHT_EYE, getDistance, lensFitScore, measureMediaPipeEye } from '../engine';
-import { drawLens } from '../engine/web';
+import { createFaceLandmarker, drawLens } from '../engine/web';
 
 // Put face photos in dev/fixtures/ (gitignored) and list them here, or pick files on the page.
 const PHOTOS = ['./fixtures/burst-face.jpg', './fixtures/hero.jpg'];
@@ -18,18 +18,9 @@ const loadImage = (src: string) =>
     img.src = src;
   });
 
-const createFaceMesh = () => {
-  const faceMesh = new window.FaceMesh({
-    locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${file}`,
-  });
-  faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, staticImageMode: true, minDetectionConfidence: 0.5 });
-  let resolveNext: (lm: Point[] | null) => void = () => {};
-  faceMesh.onResults((results: any) => resolveNext(results.multiFaceLandmarks?.[0] ?? null));
-  return async (img: HTMLImageElement) => {
-    const done = new Promise<Point[] | null>(r => (resolveNext = r));
-    await faceMesh.send({ image: img });
-    return done;
-  };
+const createDetector = () => {
+  const landmarker = createFaceLandmarker('IMAGE');
+  return async (img: HTMLImageElement): Promise<Point[] | null> => (await landmarker).detect(img).faceLandmarks[0] ?? null;
 };
 
 /** The engine before this change: center from landmark 468 only, 1.15x the iris, no eyelid clipping. */
@@ -55,7 +46,7 @@ const figure = (canvas: HTMLCanvasElement, caption: string) => {
   return f;
 };
 
-const detect = createFaceMesh();
+const detect = createDetector();
 
 async function run(photos: string[]) {
   const status = document.getElementById('status')!;

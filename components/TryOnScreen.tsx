@@ -4,6 +4,7 @@ import { Lens } from '../types';
 import { LENSES } from '../constants';
 import {
   EyeTracker,
+  blendshapeScores,
   LEFT_EYE,
   RIGHT_EYE,
   Point,
@@ -12,7 +13,7 @@ import {
   mapLandmark,
   measureMediaPipeEye,
 } from '../engine';
-import { addWatermark, drawLens, shareImage } from '../engine/web';
+import { FaceLandmarker, addWatermark, createFaceLandmarker, drawLens, onVideoFrames, shareImage } from '../engine/web';
 
 // --- CONFIGURATION ---
 const LENS_OPACITY = 0.65; // 35% transparent (65% opaque) so color shows properly
@@ -47,11 +48,8 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
   const canvasRef = useRef<HTMLCanvasElement>(null);
   
   // Logic Refs
-  const requestRef = useRef<number>(0);
-  const faceMeshRef = useRef<any>(null);
-  const cameraUtilsRef = useRef<any>(null);
-  const activeRef = useRef(true);
-  const landmarksRef = useRef<any>(null);
+  // FaceLandmarker needs strictly increasing timestamps
+  const lastDetectTimeRef = useRef(0);
 
   // Per-eye smoothing + blink state, kept outside React so the render loop never re-renders
   const eyeTrackers = useRef({
@@ -70,76 +68,60 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
 
   // --- INITIALIZATION ---
   useEffect(() => {
-    activeRef.current = true;
+    // Local, not a ref: under StrictMode the first mount's async setup must see its own cancellation
+    let cancelled = false;
+    let stream: MediaStream | null = null;
+    let landmarker: FaceLandmarker | null = null;
+    let stopFrames: (() => void) | null = null;
 
     const startApp = async () => {
-      if (!window.FaceMesh || !videoRef.current || !canvasRef.current || !containerRef.current) {
+      const video = videoRef.current;
+      if (!video || !navigator.mediaDevices?.getUserMedia) {
         setCameraState('ERROR');
         return;
       }
-      
-      const canvas = canvasRef.current;
-      canvas.width = containerRef.current.clientWidth;
-      canvas.height = containerRef.current.clientHeight;
 
-      const faceMesh = new window.FaceMesh({ 
-        locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` 
-      });
-      
-      faceMesh.setOptions({
-        maxNumFaces: 1,
-        refineLandmarks: true,
-        minDetectionConfidence: 0.6,
-        minTrackingConfidence: 0.6
-      });
-
-      faceMesh.onResults((results: any) => {
-        // setState with an unchanged string is a no-op, so this only re-renders on a status change
-        if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
-          landmarksRef.current = results.multiFaceLandmarks[0];
-          setTrackingStatus('LOCKED');
-        } else {
-          landmarksRef.current = null;
-          eyeTrackers.current.right.reset();
-          eyeTrackers.current.left.reset();
-          setTrackingStatus('SEARCHING');
-        }
-      });
-      faceMeshRef.current = faceMesh;
-
-      const camera = new window.Camera(videoRef.current, {
-        onFrame: async () => {
-          if (activeRef.current && videoRef.current && faceMeshRef.current) {
-            await faceMeshRef.current.send({ image: videoRef.current });
-          }
-        },
-        width: 1280,
-        height: 720,
-        facingMode: 'user'
-      });
+      // Load the model while the user answers the camera prompt
+      const landmarkerPromise = createFaceLandmarker('VIDEO');
+      landmarkerPromise.then(l => (cancelled ? l.close() : (landmarker = l)), () => {});
 
       try {
-        await camera.start();
-        setCameraState('READY');
-        startRenderLoop();
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+        });
+        if (cancelled) return;
+        video.srcObject = stream;
+        await video.play();
       } catch (e: any) {
-        console.error("Camera Error:", e);
-        if (e.name === 'NotAllowedError' || e.message?.includes('Permission denied')) {
-          setCameraState('PERMISSION_DENIED');
-        } else {
+        if (cancelled) return;
+        console.error('Camera Error:', e);
+        setCameraState(e?.name === 'NotAllowedError' ? 'PERMISSION_DENIED' : 'ERROR');
+        return;
+      }
+
+      let ready: FaceLandmarker;
+      try {
+        ready = await landmarkerPromise;
+      } catch (e) {
+        if (!cancelled) {
+          console.error('Face tracking failed to load:', e);
           setCameraState('ERROR');
         }
+        return;
       }
-      cameraUtilsRef.current = camera;
+      if (cancelled) return;
+      setCameraState('READY');
+      stopFrames = onVideoFrames(video, timeMs => renderFrame(ready, timeMs));
     };
 
     startApp();
 
     return () => {
-      activeRef.current = false;
-      cancelAnimationFrame(requestRef.current);
-      if (cameraUtilsRef.current) cameraUtilsRef.current.stop();
-      if (faceMeshRef.current) faceMeshRef.current.close();
+      cancelled = true;
+      stopFrames?.();
+      stream?.getTracks().forEach(track => track.stop());
+      landmarker?.close();
     };
   }, []);
 
@@ -176,9 +158,14 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
   };
 
   // --- RENDER LOOP ---
-  const drawLenses = (ctx: CanvasRenderingContext2D, landmarks: Point[], vW: number, vH: number, canvasW: number, canvasH: number) => {
+  const drawLenses = (
+    ctx: CanvasRenderingContext2D,
+    landmarks: Point[],
+    blendshapes: Record<string, number>,
+    timeMs: number,
+    vW: number, vH: number, canvasW: number, canvasH: number
+  ) => {
       const project = (lm: Point) => mapLandmark(lm, vW, vH, canvasW, canvasH);
-      const now = performance.now();
       const color = currentLensRef.current.color;
 
       const eyes = [
@@ -186,44 +173,59 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
           { tracker: eyeTrackers.current.left, indices: LEFT_EYE },
       ];
       for (const { tracker, indices } of eyes) {
-          const eye = tracker.update(measureMediaPipeEye(landmarks, indices, project), sizeAdjustmentRef.current, now);
+          const eye = tracker.update(measureMediaPipeEye(landmarks, indices, project, blendshapes), sizeAdjustmentRef.current, timeMs);
           if (eye) drawLens(ctx, eye.x, eye.y, eye.radius, color, { opacity: LENS_OPACITY, clip: eye.outline, realistic: true });
       }
   };
 
-  const startRenderLoop = () => {
-    const render = () => {
-      if (!activeRef.current || !canvasRef.current || !videoRef.current || !containerRef.current) return;
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
-      const video = videoRef.current;
-      const vW = video.videoWidth;
-      const vH = video.videoHeight;
-      if (!ctx || video.readyState < 2 || !vW || !vH) {
-          requestRef.current = requestAnimationFrame(render);
-          return;
-      }
+  /**
+   * Runs once per new camera frame: detect on the frame, then draw that same frame and its lenses.
+   * The lens can never trail the eye, and the trackers get exactly one sample per detection.
+   */
+  const renderFrame = (landmarker: FaceLandmarker, timeMs: number) => {
+    const canvas = canvasRef.current;
+    const video = videoRef.current;
+    const container = containerRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (!canvas || !video || !container || !ctx) return;
+    const vW = video.videoWidth;
+    const vH = video.videoHeight;
+    if (!vW || !vH) return;
 
-      // Resizing a canvas reallocates its buffer, so only do it when the container actually changed
-      const canvasW = containerRef.current.clientWidth;
-      const canvasH = containerRef.current.clientHeight;
-      if (canvas.width !== canvasW) canvas.width = canvasW;
-      if (canvas.height !== canvasH) canvas.height = canvasH;
+    // Resizing a canvas reallocates its buffer, so only do it when the container actually changed
+    const canvasW = container.clientWidth;
+    const canvasH = container.clientHeight;
+    if (canvas.width !== canvasW) canvas.width = canvasW;
+    if (canvas.height !== canvasH) canvas.height = canvasH;
 
-      const draw = coverRect(vW, vH, canvasW, canvasH);
-      ctx.save();
-      ctx.translate(canvasW, 0);
-      ctx.scale(-1, 1);
-      ctx.drawImage(video, draw.x, draw.y, draw.width, draw.height);
-      ctx.restore();
+    const detectTime = Math.max(timeMs, lastDetectTimeRef.current + 1);
+    lastDetectTimeRef.current = detectTime;
+    let result;
+    try {
+      result = landmarker.detectForVideo(video, detectTime);
+    } catch (e) {
+      console.error('Face detection failed on this frame:', e);
+    }
 
-      if (landmarksRef.current) {
-        drawLenses(ctx, landmarksRef.current, vW, vH, canvasW, canvasH);
-      }
+    const draw = coverRect(vW, vH, canvasW, canvasH);
+    ctx.save();
+    ctx.translate(canvasW, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, draw.x, draw.y, draw.width, draw.height);
+    ctx.restore();
 
-      requestRef.current = requestAnimationFrame(render);
-    };
-    render();
+    // setState with an unchanged string is a no-op, so this only re-renders on a status change
+    const face = result?.faceLandmarks[0];
+    if (face) {
+      setTrackingStatus('LOCKED');
+      const blendshapes = blendshapeScores(result?.faceBlendshapes[0]?.categories);
+      drawLenses(ctx, face, blendshapes, detectTime, vW, vH, canvasW, canvasH);
+    } else {
+      // Reset so the next lock snaps into place instead of gliding in
+      eyeTrackers.current.right.reset();
+      eyeTrackers.current.left.reset();
+      setTrackingStatus('SEARCHING');
+    }
   };
 
   return (

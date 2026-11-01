@@ -14,6 +14,11 @@ export interface EyeMeasurement {
   irisDiameter: number;
   /** Lid gap / eye width: roughly 0.25-0.35 open, under 0.15 closed. */
   openness: number;
+  /**
+   * Blink score from FaceLandmarker's eyeBlink blendshape (0 open, 1 closed), when available.
+   * More reliable than `openness`: it is not fooled by squinting or by looking down.
+   */
+  blink?: number;
   /** The visible eye opening. The eyelids always cover part of the iris, so the lens is clipped to this. */
   outline: Point[];
 }
@@ -27,11 +32,15 @@ export const eyeOpenness = (lidTop: Point, lidBottom: Point, cornerInner: Point,
   return width > 0 ? getDistance(lidTop, lidBottom) / width : 0;
 };
 
-/** Measures an eye from MediaPipe FaceMesh landmarks (needs refineLandmarks for the iris). */
+/**
+ * Measures an eye from MediaPipe's 478 face landmarks (FaceLandmarker, or FaceMesh with refineLandmarks).
+ * Pass FaceLandmarker's blendshape scores (see `blendshapeScores`) to drive blink detection with them.
+ */
 export const measureMediaPipeEye = (
   landmarks: Point[],
   indices: EyeIndices,
-  project: (lm: Point) => Point
+  project: (lm: Point) => Point,
+  blendshapes?: Record<string, number>
 ): EyeMeasurement | null => {
   const { iris, lids, corners, outline } = indices;
   const ids = [iris.center, iris.top, iris.bottom, iris.left, iris.right, lids.top, lids.bottom, corners.inner, corners.outer, ...outline];
@@ -49,6 +58,7 @@ export const measureMediaPipeEye = (
     irisDiameter: (getDistance(ring[3], ring[1]) + getDistance(ring[0], ring[2])) / 2,
     openness: eyeOpenness(p(lids.top), p(lids.bottom), p(corners.inner), p(corners.outer)),
     outline: outline.map(p),
+    blink: blendshapes?.[indices.blinkBlendshape],
   };
 };
 
@@ -94,17 +104,26 @@ export const measureContourEye = (contour: Point[]): EyeMeasurement | null => {
   };
 };
 
-/** Blink detector with hysteresis so the lens does not flicker around the threshold. */
+/**
+ * Blink detector with hysteresis so the lens does not flicker around the threshold.
+ * Uses the blendshape blink score when the tracker provides one, otherwise the lid-gap openness.
+ */
 export class BlinkDetector {
   private closed = false;
 
   constructor(
     private readonly closeBelow = 0.16,
-    private readonly openAbove = 0.2
+    private readonly openAbove = 0.2,
+    // Blendshape score: about 0-0.3 open, up to ~0.5 when looking down, 0.7+ closed
+    private readonly blinkCloseAbove = 0.6,
+    private readonly blinkOpenBelow = 0.45
   ) {}
 
-  update(openness: number): boolean {
-    if (this.closed && openness > this.openAbove) this.closed = false;
+  update(openness: number, blink?: number): boolean {
+    if (blink !== undefined) {
+      if (this.closed && blink < this.blinkOpenBelow) this.closed = false;
+      else if (!this.closed && blink > this.blinkCloseAbove) this.closed = true;
+    } else if (this.closed && openness > this.openAbove) this.closed = false;
     else if (!this.closed && openness < this.closeBelow) this.closed = true;
     return this.closed;
   }
@@ -161,7 +180,7 @@ export class EyeTracker {
       this.reset();
       return null;
     }
-    if (this.blink.update(measurement.openness)) return null;
+    if (this.blink.update(measurement.openness, measurement.blink)) return null;
 
     return {
       x: this.fx.filter(measurement.center.x, timeMs),

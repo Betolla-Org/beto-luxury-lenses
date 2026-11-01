@@ -4,7 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Lens Fit Preview</title>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js" crossorigin="anonymous"></script>
   <style>
     :root { color-scheme: dark; }
     body { margin: 0; padding: 16px; background: #0a0a0a; color: #eee; font: 14px/1.5 system-ui, sans-serif; }
@@ -25,7 +24,7 @@
 <body>
   <h1>Lens fit: old vs new engine</h1>
   <p class="note">
-    Runs the same MediaPipe FaceMesh as the live try-on on still photos. Fit = overlap (IoU) between the painted lens and
+    Runs the same MediaPipe FaceLandmarker as the live try-on on still photos. Fit = overlap (IoU) between the painted lens and
     the visible iris, where "visible iris" is MediaPipe's iris circle minus whatever the eyelids cover. Paint on the lids or
     the white of the eye lowers it.
   </p>
