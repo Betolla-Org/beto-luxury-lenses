@@ -1,0 +1,34 @@
+{
+  "expo": {
+    "name": "BETO",
+    "slug": "beto-luxury-lenses",
+    "scheme": "beto",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0A0A0A",
+    "ios": {
+      "bundleIdentifier": "com.betolla.betolenses",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSCameraUsageDescription": "BETO uses the front camera so you can try lenses on your eyes live. Video never leaves your phone."
+      }
+    },
+    "android": {
+      "package": "com.betolla.betolenses",
+      "permissions": ["android.permission.CAMERA"],
+      "adaptiveIcon": {
+        "backgroundColor": "#0A0A0A",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": ["expo-router", "expo-font", "expo-image"],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

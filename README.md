@@ -40,24 +40,33 @@ constants.tsx        Lens catalogue, collections and image URLs
 types.ts             Shared types
 components/          Screens and UI pieces
   TryOnScreen.tsx    Camera, FaceMesh setup and the render loop
-engine/              Framework-free AR helpers (unit tested)
-  landmarks.ts       FaceMesh indices for each eye (iris, lids, corners)
-  geometry.ts        Distances, object-fit: cover math, landmark to canvas mapping
+engine/              AR helpers shared by web and mobile (unit tested)
+  index.ts           Platform-free core (safe to import from React Native)
+  landmarks.ts       FaceMesh indices for each eye (iris, lids, corners, eye-opening outline)
+  geometry.ts        Distances, point-in-polygon, object-fit: cover math, landmark mapping
   filters.ts         One Euro filter for jitter-free, low-lag smoothing
-  eye.ts             EyeTracker: blink detection + smoothed lens position/size
-  color.ts           Hex parsing and color shifting
-  lens-renderer.ts   Draws the tinted lens on a canvas
-  capture.ts         Watermarking, share sheet and download fallback
+  eye.ts             Measure an eye (MediaPipe or ML Kit outline) + EyeTracker smoothing/blinks
+  lens-style.ts      The lens look (colors, ring, pupil, glare) used by both renderers
+  fit.ts             Lens fit score: overlap of painted lens vs visible iris
+  web.ts             Browser-only exports:
+  lens-renderer.ts     draws the lens on a canvas (clipped, realistic blending)
+  capture.ts           watermarking, share sheet and download fallback
+mobile/              Expo React Native app, see mobile/README.md
+dev/lens-fit.html    Dev-only page: old vs new lens fit on face photos
 ```
 
 ### How the try-on engine works
 
 1. MediaPipe FaceMesh (with `refineLandmarks`) returns 478 normalized landmarks per frame.
 2. Each frame the mirrored video is drawn with `object-fit: cover` math (`coverRect`), and landmarks are mapped through the same rect so lenses line up with the eyes.
-3. One `EyeTracker` per eye measures the iris diameter, hides the lens while that eye is closed (lid gap / eye width, with hysteresis), and smooths position and size with a One Euro filter.
-4. `drawLens` paints a limbal ring, a colored donut that leaves the pupil clear, and a glare highlight.
+3. `measureMediaPipeEye` reads the iris (center averaged over 5 points, diameter from the iris edge) and the eye-opening outline. One `EyeTracker` per eye hides the lens while that eye is closed (lid gap / eye width, with hysteresis) and smooths position and size with a One Euro filter.
+4. `drawLens` paints a limbal ring, a colored donut that leaves the pupil clear, and a glare highlight, sized to the iris and **clipped to the eye opening** so nothing lands on the eyelids. In realistic mode the edge is feathered, the upper lid casts a shadow, and the tint is blended so the eye's own iris texture shows through.
 
-Tuning knobs live in `EyeTrackerOptions` (`irisScale`, filter cutoffs) and `LENS_OPACITY` in `TryOnScreen.tsx`.
+Tuning knobs live in `EyeTrackerOptions` (`irisScale`, filter cutoffs), the constants at the top of `engine/lens-renderer.ts`, and `LENS_OPACITY` in `TryOnScreen.tsx`.
+
+### Checking lens fit
+
+Run `npm run dev` and open http://localhost:3000/dev/lens-fit.html. It runs the real FaceMesh on face photos (put them in `dev/fixtures/`, which is gitignored, or pick files on the page) and shows the old engine, the new clipped lens, realistic mode and the original photo side by side with a fit score.
 
 ## Deployment
 

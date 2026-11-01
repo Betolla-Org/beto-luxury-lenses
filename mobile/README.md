@@ -1,0 +1,37 @@
+# BETO mobile app
+
+Native iOS/Android version of the BETO web app, built with Expo (SDK 58) and Expo Router.
+It shares the lens catalogue (`../constants.tsx`, `../types.ts`) and the tracking engine (`../engine`) with the web app.
+
+## Run it
+
+The live try-on uses native camera and ML modules, so it needs a **development build**; Expo Go will not work.
+
+```bash
+cd mobile
+npm install
+npm run android   # builds and installs on a connected Android phone or emulator (needs Android Studio SDK)
+npm run ios       # macOS + Xcode only
+```
+
+After the first native build, `npx expo start` is enough for JS-only changes.
+Cloud builds without local SDKs: `npx eas-cli@latest build --profile development`.
+
+## How the try-on works
+
+| Step | Code |
+| --- | --- |
+| Front camera preview | `react-native-vision-camera` v5 (`<Camera>` in `src/app/try-on/[id].tsx`) |
+| Face + eye outlines | Google ML Kit via `react-native-vision-camera-face-detector`, converted to preview coordinates |
+| Eye measure + smoothing | `measureContourEye` + `EyeTracker` from `../engine` (One Euro filter, blink hiding) |
+| Drawing | `src/components/LensOverlay.tsx`: Skia port of the web lens, clipped to the eye opening |
+
+ML Kit gives eye outlines but no iris points, so the lens is centered in the eye opening and sized from
+its width (`IRIS_TO_EYE_WIDTH`). That is accurate while the user looks at the screen; the web app's MediaPipe
+iris tracking follows sideways glances more closely.
+
+## Not in the app yet
+
+- Photo capture + share (the web app has it)
+- Admin dashboard for adding lenses
+- App icon and splash (still Expo defaults)
