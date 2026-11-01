@@ -13,6 +13,10 @@ export interface LensRenderOptions {
    * the eye's own iris texture kept under the tint instead of a flat painted disk.
    */
   realistic?: boolean;
+  /** Semi-axis across the lens's x axis, for an elliptical lens (head turned); defaults to the radius. */
+  radiusY?: number;
+  /** Rotation of the lens's x axis in radians (head roll). */
+  rotation?: number;
 }
 
 // How the realistic mode mixes the lens in. Tuned with dev/lens-fit.html.
@@ -35,8 +39,29 @@ const tracePolygon = (ctx: CanvasRenderingContext2D, points: Point[], dx = 0, dy
   ctx.closePath();
 };
 
-/** Paints the lens recipe (limbal ring, colored donut, glare) at full strength. */
-const paintLens = (ctx: CanvasRenderingContext2D, x: number, y: number, r: number, hexColor: string, pupilRatio: number) => {
+/**
+ * Paints the lens recipe (limbal ring, colored donut, glare) at full strength, as a circle of
+ * radius `r` squashed to `ry` across and rotated by `rotation`: how a round iris looks on a turned head.
+ */
+const paintLens = (
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  r: number,
+  hexColor: string,
+  pupilRatio: number,
+  ry = r,
+  rotation = 0
+) => {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(rotation);
+  ctx.scale(1, ry / r);
+  paintRoundLens(ctx, 0, 0, r, hexColor, pupilRatio);
+  ctx.restore();
+};
+
+const paintRoundLens = (ctx: CanvasRenderingContext2D, x: number, y: number, r: number, hexColor: string, pupilRatio: number) => {
   const style = lensStyle(hexColor, pupilRatio);
   const outer = r * style.body.outerRatio;
   const pupil = r * style.pupilRatio;
@@ -70,16 +95,16 @@ const paintLens = (ctx: CanvasRenderingContext2D, x: number, y: number, r: numbe
   ctx.fill();
 };
 
-/** Draws a tinted contact lens centered on (x, y). */
+/** Draws a tinted contact lens centered on (x, y); `r` is its radius, or its x semi-axis when elliptical. */
 export const drawLens = (
   ctx: CanvasRenderingContext2D,
   x: number,
   y: number,
   r: number,
   hexColor: string,
-  { opacity = 0.65, pupilRatio = 0.25, clip, realistic = false }: LensRenderOptions = {}
+  { opacity = 0.65, pupilRatio = 0.25, clip, realistic = false, radiusY = r, rotation = 0 }: LensRenderOptions = {}
 ) => {
-  if (r <= 0) return;
+  if (r <= 0 || radiusY <= 0) return;
   const hasClip = !!clip && clip.length >= 3;
 
   if (!realistic || !hasClip) {
@@ -90,25 +115,26 @@ export const drawLens = (
     }
     ctx.globalAlpha = opacity;
     ctx.globalCompositeOperation = 'source-over';
-    paintLens(ctx, x, y, r, hexColor, pupilRatio);
+    paintLens(ctx, x, y, r, hexColor, pupilRatio, radiusY, rotation);
     ctx.restore();
     return;
   }
 
   // Realistic: build the lens on a scratch canvas, shape it to the eye opening, then blend it in.
-  const pad = Math.ceil(r * 0.2) + 2;
-  const size = 2 * (r + pad);
+  const extent = Math.max(r, radiusY);
+  const pad = Math.ceil(extent * 0.2) + 2;
+  const size = 2 * (extent + pad);
   const canvas = getScratch(size);
   const s = canvas.getContext('2d')!;
-  const ox = r + pad - x; // eye -> scratch offset
-  const oy = r + pad - y;
+  const ox = extent + pad - x; // eye -> scratch offset
+  const oy = extent + pad - y;
   s.save();
   s.clearRect(0, 0, size, size);
-  paintLens(s, x + ox, y + oy, r, hexColor, pupilRatio);
+  paintLens(s, x + ox, y + oy, r, hexColor, pupilRatio, radiusY, rotation);
 
   // Upper-lid shadow: the lid shades the top of the iris
   const lidTop = Math.min(...clip!.map(p => p.y)) + oy;
-  const shadow = s.createLinearGradient(0, lidTop, 0, lidTop + r * 0.7);
+  const shadow = s.createLinearGradient(0, lidTop, 0, lidTop + extent * 0.7);
   shadow.addColorStop(0, `rgba(0, 0, 0, ${LID_SHADOW})`);
   shadow.addColorStop(1, 'rgba(0, 0, 0, 0)');
   s.globalCompositeOperation = 'source-atop';
@@ -117,14 +143,14 @@ export const drawLens = (
 
   // Keep only what lies inside the eye opening, with a feathered edge
   s.globalCompositeOperation = 'destination-in';
-  s.filter = `blur(${Math.max(0.5, r * FEATHER_RATIO)}px)`;
+  s.filter = `blur(${Math.max(0.5, extent * FEATHER_RATIO)}px)`;
   tracePolygon(s, clip!, ox, oy);
   s.fillStyle = '#000';
   s.fill();
   s.restore();
 
-  const dx = x - r - pad;
-  const dy = y - r - pad;
+  const dx = x - extent - pad;
+  const dy = y - extent - pad;
   ctx.save();
   ctx.globalCompositeOperation = 'color';
   ctx.globalAlpha = opacity * TINT_STRENGTH / 0.65;

@@ -3,7 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { TASKS_VISION_VERSION } from './mediapipe-assets';
 import {
   BlinkDetector,
+  EyeMeasurement,
   EyeTracker,
+  FaceTracker,
+  applyIrisRefinement,
+  axisAngle,
+  fitCircle,
+  refineIris,
+  smoothClosedCurve,
   LEFT_EYE,
   blendshapeScores,
   IRIS_TO_EYE_WIDTH,
@@ -212,7 +219,8 @@ describe('EyeTracker', () => {
   it('places the lens on the iris, sizes it to the iris and carries the eye outline', () => {
     const eye = new EyeTracker().update(measure(buildFace(10)), 1.2, 0)!;
     expect({ x: eye.x, y: eye.y, radius: eye.radius }).toEqual({ x: 50, y: 50, radius: 6 });
-    expect(eye.outline).toHaveLength(RIGHT_EYE.outline.length);
+    // The outline is rounded into a curve: 4 points per original segment by default
+    expect(eye.outline).toHaveLength(RIGHT_EYE.outline.length * 4);
   });
 
   it('hides the lens while the eye is closed', () => {
@@ -230,5 +238,139 @@ describe('EyeTracker', () => {
   it('returns null when landmarks are missing', () => {
     expect(measure([])).toBeNull();
     expect(new EyeTracker().update(null, 1, 0)).toBeNull();
+  });
+});
+
+describe('smoothClosedCurve', () => {
+  it('passes through the original points and adds points between them', () => {
+    const square = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
+    const curve = smoothClosedCurve(square, 4);
+    expect(curve).toHaveLength(16);
+    expect(curve[0]).toEqual({ x: 0, y: 0 });
+    expect(curve[4]).toEqual({ x: 10, y: 0 });
+  });
+
+  it('leaves tiny polygons alone', () => {
+    const line = [{ x: 0, y: 0 }, { x: 1, y: 1 }];
+    expect(smoothClosedCurve(line)).toBe(line);
+  });
+});
+
+describe('iris ellipse', () => {
+  const eye = (width: number, height: number, angle = 0): EyeMeasurement => ({
+    center: { x: 50, y: 50 },
+    irisDiameter: (width + height) / 2,
+    openness: 0.3,
+    outline: [{ x: 30, y: 50 }, { x: 50, y: 40 }, { x: 70, y: 50 }, { x: 50, y: 60 }],
+    irisShape: { width, height, angle },
+  });
+
+  it('folds axis angles so left-to-right and right-to-left mean the same', () => {
+    expect(axisAngle(Math.PI)).toBeCloseTo(0);
+    expect(axisAngle(Math.PI + 0.1)).toBeCloseTo(0.1);
+    expect(axisAngle(-0.1)).toBeCloseTo(-0.1);
+  });
+
+  it('becomes an ellipse when the iris looks narrow, sized by its larger axis', () => {
+    const state = new EyeTracker().update(eye(7, 10, 0.2), 1, 0)!;
+    expect(state.radius).toBeCloseTo(5);
+    expect(state.radiusY).toBeCloseTo(5);
+    expect(state.radiusX).toBeCloseTo(3.5);
+    expect(state.rotation).toBeCloseTo(0.2);
+  });
+
+  it('stays round for small aspect jitter', () => {
+    const state = new EyeTracker().update(eye(9.7, 10), 1, 0)!;
+    expect(state.radiusX).toBe(state.radiusY);
+  });
+});
+
+describe('FaceTracker', () => {
+  const eye = (diameter: number): EyeMeasurement => ({
+    center: { x: 50, y: 50 },
+    irisDiameter: diameter,
+    openness: 0.3,
+    outline: [{ x: 30, y: 50 }, { x: 50, y: 40 }, { x: 70, y: 50 }, { x: 50, y: 60 }],
+  });
+
+  it('gives both eyes the same size: the average of the two readings', () => {
+    const { right, left } = new FaceTracker().update(eye(10), eye(12), 1, 0);
+    expect(right!.radius).toBeCloseTo(5.5);
+    expect(left!.radius).toBeCloseTo(5.5);
+  });
+
+  it('lets one open eye carry the size while the other is not measured', () => {
+    const { right, left } = new FaceTracker().update(eye(10), null, 1, 0);
+    expect(right!.radius).toBeCloseTo(5);
+    expect(left).toBeNull();
+  });
+
+  it('ignores a one-frame size glitch but follows a change that persists', () => {
+    const face = new FaceTracker();
+    face.update(eye(10), eye(10), 1, 0);
+    expect(face.update(eye(20), eye(20), 1, 33).right!.radius).toBeCloseTo(5); // glitch: ignored
+    let r = 0;
+    for (let i = 2; i <= 6; i++) r = face.update(eye(20), eye(20), 1, i * 33).right!.radius;
+    expect(r).toBeCloseTo(10); // persisted for 5 frames: snapped to
+  });
+});
+
+describe('iris pixel refinement', () => {
+  // A synthetic eye: bright sclera, dark iris (r = 14) and darker pupil, centered at (50, 50)
+  const W = 100;
+  const H = 100;
+  const makeEye = (iris: { x: number; y: number; r: number } | null) => {
+    const data = new Uint8ClampedArray(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const d = iris ? Math.hypot(x + 0.5 - iris.x, y + 0.5 - iris.y) : Infinity;
+        const v = d < 5 ? 20 : iris && d < iris.r ? 70 : 210;
+        const i = (y * W + x) * 4;
+        data[i] = data[i + 1] = data[i + 2] = v;
+        data[i + 3] = 255;
+      }
+    }
+    return { data, width: W, height: H, x: 0, y: 0 };
+  };
+  const outline = Array.from({ length: 32 }, (_, k) => {
+    const a = (k / 32) * Math.PI * 2;
+    return { x: 50 + 40 * Math.cos(a), y: 50 + 18 * Math.sin(a) };
+  });
+
+  it('fits a circle exactly to points on a circle', () => {
+    const points = Array.from({ length: 12 }, (_, k) => ({ x: 3 + 7 * Math.cos(k), y: -2 + 7 * Math.sin(k) }));
+    const c = fitCircle(points)!;
+    expect(c.x).toBeCloseTo(3);
+    expect(c.y).toBeCloseTo(-2);
+    expect(c.r).toBeCloseTo(7);
+  });
+
+  it('pulls an off-center, undersized landmark estimate onto the real iris edge', () => {
+    const refined = refineIris(makeEye({ x: 50, y: 50, r: 14 }), { x: 52, y: 49, r: 12 }, outline)!;
+    expect(refined).not.toBeNull();
+    expect(refined.x).toBeCloseTo(50, 0);
+    expect(refined.y).toBeCloseTo(50, 0);
+    expect(refined.r).toBeCloseTo(14, 0);
+  });
+
+  it('gives up when there is no iris edge to find', () => {
+    expect(refineIris(makeEye(null), { x: 50, y: 50, r: 12 }, outline)).toBeNull();
+  });
+
+  it('moves the center toward the fit, and the size only while the iris looks round', () => {
+    const base = {
+      center: { x: 52, y: 49 },
+      irisDiameter: 24,
+      openness: 0.3,
+      outline,
+    };
+    const round = applyIrisRefinement({ ...base, irisShape: { width: 24, height: 24, angle: 0 } }, { x: 50, y: 50, r: 14 }, 1);
+    expect(round.center).toEqual({ x: 50, y: 50 });
+    expect(round.irisShape!.width).toBeCloseTo(28);
+
+    const turned = applyIrisRefinement({ ...base, irisShape: { width: 16, height: 24, angle: 0 } }, { x: 50, y: 50, r: 14 }, 1);
+    expect(turned.center).toEqual({ x: 50, y: 50 });
+    expect(turned.irisShape!.width).toBe(16);
+    expect(applyIrisRefinement(base, null)).toBe(base);
   });
 });

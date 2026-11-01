@@ -5,5 +5,6 @@ export * from './geometry';
 export * from './filters';
 export * from './color';
 export * from './eye';
+export * from './iris';
 export * from './lens-style';
 export * from './fit';

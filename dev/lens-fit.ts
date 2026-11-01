@@ -1,5 +1,16 @@
 // Dev-only page (not part of the production build): npm run dev, then open /dev/lens-fit.html
-import { EyeIndices, LEFT_EYE, Point, RIGHT_EYE, getDistance, lensFitScore, measureMediaPipeEye } from '../engine';
+import {
+  EyeIndices,
+  LEFT_EYE,
+  Point,
+  RIGHT_EYE,
+  applyIrisRefinement,
+  getDistance,
+  lensFitScore,
+  measureMediaPipeEye,
+  refineIris,
+  smoothClosedCurve,
+} from '../engine';
 import { createFaceLandmarker, drawLens } from '../engine/web';
 
 // Put face photos in dev/fixtures/ (gitignored) and list them here, or pick files on the page.
@@ -44,6 +55,12 @@ const figure = (canvas: HTMLCanvasElement, caption: string) => {
   c.innerHTML = caption;
   f.append(canvas, c);
   return f;
+};
+
+/** The whole photo as a pixel patch for refineIris. */
+const pickPatch = (canvas: HTMLCanvasElement) => {
+  const image = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height);
+  return { data: image.data, width: image.width, height: image.height, x: 0, y: 0 };
 };
 
 const detect = createDetector();
@@ -107,18 +124,32 @@ async function run(photos: string[]) {
       actx.drawImage(base, 0, 0);
       drawLens(actx, iris.x, iris.y, iris.r, COLOR, { opacity: OPACITY, clip: m.outline });
 
+      // The live pipeline: pixel-refined iris, elliptical lens, outline rounded into a curve
+      const refined = refineIris(pickPatch(base), iris, m.outline);
+      const live = applyIrisRefinement(m, refined);
+      const shape = live.irisShape!;
       const real = document.createElement('canvas');
       real.width = W;
       real.height = H;
       const rctx = real.getContext('2d')!;
       rctx.drawImage(base, 0, 0);
-      drawLens(rctx, iris.x, iris.y, iris.r, COLOR, { opacity: OPACITY, clip: m.outline, realistic: true });
+      drawLens(rctx, live.center.x, live.center.y, shape.width / 2, COLOR, {
+        opacity: OPACITY,
+        clip: smoothClosedCurve(m.outline),
+        realistic: true,
+        radiusY: shape.height / 2,
+        rotation: shape.angle,
+      });
+      const moved = getDistance(live.center, m.center);
+      const refineNote = refined
+        ? `pixel refinement moved the center ${moved.toFixed(1)}px, ${refined.points.length} edge points`
+        : 'pixel refinement found no clear edge (landmarks kept)';
 
       const half = iris.r * 3.2;
       rows.append(
         figure(crop(before, m.center, half), `${name} · <span class="old">old engine: ${(score.old * 100).toFixed(0)}% fit</span>`),
         figure(crop(after, m.center, half), `${name} · <span class="new">new, clipped: ${(score.next * 100).toFixed(0)}% fit</span>`),
-        figure(crop(real, m.center, half), `${name} · <span class="new">new, realistic mode</span>`),
+        figure(crop(real, m.center, half), `${name} · <span class="new">live pipeline (realistic)</span> · ${refineNote}`),
         figure(crop(base, m.center, half), `${name} · original photo`)
       );
     }

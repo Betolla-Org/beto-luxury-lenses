@@ -3,8 +3,11 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Lens } from '../types';
 import { LENSES } from '../constants';
 import {
-  EyeTracker,
+  EyeMeasurement,
+  FaceTracker,
+  applyIrisRefinement,
   blendshapeScores,
+  refineIris,
   LEFT_EYE,
   RIGHT_EYE,
   Point,
@@ -51,11 +54,8 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
   // FaceLandmarker needs strictly increasing timestamps
   const lastDetectTimeRef = useRef(0);
 
-  // Per-eye smoothing + blink state, kept outside React so the render loop never re-renders
-  const eyeTrackers = useRef({
-    right: new EyeTracker(),
-    left: new EyeTracker(),
-  });
+  // Smoothing, shared iris size and blink state for both eyes, kept outside React so the render loop never re-renders
+  const faceTracker = useRef(new FaceTracker());
   // The render loop is started once, so it reads the size through a ref, not the stale state
   const sizeAdjustmentRef = useRef(sizeAdjustment);
   useEffect(() => {
@@ -158,6 +158,25 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
   };
 
   // --- RENDER LOOP ---
+  /**
+   * Sharpens the landmark measurements with the frame's own pixels: finds each iris edge
+   * (engine/iris.ts). Must run after the video frame is drawn and before any lens is.
+   * Reads one pixel block covering both eyes, because every canvas readback stalls the GPU.
+   */
+  const refineWithPixels = (ctx: CanvasRenderingContext2D, eyes: (EyeMeasurement | null)[]) => {
+    const found = eyes.filter((m): m is EyeMeasurement => !!m);
+    if (!found.length) return eyes;
+    const reach = (m: EyeMeasurement) => Math.ceil(m.irisDiameter * 0.8) + 2;
+    const x0 = Math.max(0, Math.floor(Math.min(...found.map(m => m.center.x - reach(m)))));
+    const y0 = Math.max(0, Math.floor(Math.min(...found.map(m => m.center.y - reach(m)))));
+    const x1 = Math.min(ctx.canvas.width, Math.ceil(Math.max(...found.map(m => m.center.x + reach(m)))));
+    const y1 = Math.min(ctx.canvas.height, Math.ceil(Math.max(...found.map(m => m.center.y + reach(m)))));
+    if (x1 - x0 < 8 || y1 - y0 < 8) return eyes;
+    const image = ctx.getImageData(x0, y0, x1 - x0, y1 - y0);
+    const patch = { data: image.data, width: image.width, height: image.height, x: x0, y: y0 };
+    return eyes.map(m => m && applyIrisRefinement(m, refineIris(patch, { x: m.center.x, y: m.center.y, r: m.irisDiameter / 2 }, m.outline)));
+  };
+
   const drawLenses = (
     ctx: CanvasRenderingContext2D,
     landmarks: Point[],
@@ -168,13 +187,22 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
       const project = (lm: Point) => mapLandmark(lm, vW, vH, canvasW, canvasH);
       const color = currentLensRef.current.color;
 
-      const eyes = [
-          { tracker: eyeTrackers.current.right, indices: RIGHT_EYE },
-          { tracker: eyeTrackers.current.left, indices: LEFT_EYE },
-      ];
-      for (const { tracker, indices } of eyes) {
-          const eye = tracker.update(measureMediaPipeEye(landmarks, indices, project, blendshapes), sizeAdjustmentRef.current, timeMs);
-          if (eye) drawLens(ctx, eye.x, eye.y, eye.radius, color, { opacity: LENS_OPACITY, clip: eye.outline, realistic: true });
+      // Measure both eyes before painting anything, so the pixel refinement only sees the camera image
+      const [right, left] = refineWithPixels(ctx, [
+          measureMediaPipeEye(landmarks, RIGHT_EYE, project, blendshapes),
+          measureMediaPipeEye(landmarks, LEFT_EYE, project, blendshapes),
+      ]);
+      const eyes = faceTracker.current.update(right, left, sizeAdjustmentRef.current, timeMs);
+
+      for (const eye of [eyes.right, eyes.left]) {
+          if (!eye) continue;
+          drawLens(ctx, eye.x, eye.y, eye.radiusX, color, {
+              opacity: LENS_OPACITY,
+              clip: eye.outline,
+              realistic: true,
+              radiusY: eye.radiusY,
+              rotation: eye.rotation,
+          });
       }
   };
 
@@ -222,8 +250,7 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
       drawLenses(ctx, face, blendshapes, detectTime, vW, vH, canvasW, canvasH);
     } else {
       // Reset so the next lock snaps into place instead of gliding in
-      eyeTrackers.current.right.reset();
-      eyeTrackers.current.left.reset();
+      faceTracker.current.reset();
       setTrackingStatus('SEARCHING');
     }
   };

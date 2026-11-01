@@ -45,7 +45,9 @@ engine/              AR helpers shared by web and mobile (unit tested)
   landmarks.ts       Face-mesh indices for each eye (iris, lids, corners, eye-opening outline) + blendshapes
   geometry.ts        Distances, point-in-polygon, object-fit: cover math, landmark mapping
   filters.ts         One Euro filter for jitter-free, low-lag smoothing
-  eye.ts             Measure an eye (MediaPipe or ML Kit outline) + EyeTracker smoothing/blinks
+  eye.ts             Measure an eye (MediaPipe or ML Kit outline), EyeTracker (smoothing, blinks, ellipse)
+                     and FaceTracker (both eyes, one shared iris size)
+  iris.ts            Finds the iris edge in the pixels and fits a circle to it (refines the landmarks)
   lens-style.ts      The lens look (colors, ring, pupil, glare) used by both renderers
   fit.ts             Lens fit score: overlap of painted lens vs visible iris
   web.ts             Browser-only exports:
@@ -61,14 +63,18 @@ dev/lens-fit.html    Dev-only page: old vs new lens fit on face photos
 
 1. `onVideoFrames` (`requestVideoFrameCallback`, with a `requestAnimationFrame` fallback) fires once per new camera frame. FaceLandmarker runs on that frame and returns 478 normalized landmarks plus blendshapes, and the same frame is then drawn, so the lens never trails the eye and the smoothing filters get exactly one sample per detection.
 2. The mirrored video is drawn with `object-fit: cover` math (`coverRect`), and landmarks are mapped through the same rect so lenses line up with the eyes.
-3. `measureMediaPipeEye` reads the iris (center averaged over 5 points, diameter from the iris edge) and the eye-opening outline. One `EyeTracker` per eye hides the lens while that eye is closed (the `eyeBlink` blendshape, with hysteresis; lid gap / eye width when no blendshapes are available, as on mobile) and smooths position and size with a One Euro filter.
-4. `drawLens` paints a limbal ring, a colored donut that leaves the pupil clear, and a glare highlight, sized to the iris and **clipped to the eye opening** so nothing lands on the eyelids. In realistic mode the edge is feathered, the upper lid casts a shadow, and the tint is blended so the eye's own iris texture shows through.
+3. `measureMediaPipeEye` reads the iris (center averaged over 5 points, width and height from its edge points, and the angle of its left-right axis) and the eye-opening outline.
+4. `refineIris` reads one pixel block around both eyes from the frame just drawn, casts rays sideways from each iris center (the lids cover the top and bottom), finds the dark-to-light step where the iris meets the white of the eye, and fits a circle to those points with outlier rejection. `applyIrisRefinement` moves the center 70% of the way to that fit, and the size too while the iris looks round. With weak evidence it keeps the landmarks.
+5. `FaceTracker` gives both eyes one shared iris size (average of both readings, one-frame glitches ignored) and runs one `EyeTracker` per eye, which hides the lens while that eye is closed (the `eyeBlink` blendshape, with hysteresis; lid gap / eye width when no blendshapes are available, as on mobile), smooths position and size with One Euro filters, turns the iris width/height ratio into an elliptical lens when the head turns, follows head roll, and rounds the 16-point eye outline into a smooth curve.
+6. `drawLens` paints a limbal ring, a colored donut that leaves the pupil clear, and a glare highlight, sized and shaped to the iris and **clipped to the eye opening** so nothing lands on the eyelids. In realistic mode the edge is feathered, the upper lid casts a shadow, and the tint is blended so the eye's own iris texture shows through.
+
+There is no latency prediction: each lens is drawn on the very frame it was measured on, so predicting ahead would push it past the eye.
 
 Tuning knobs live in `EyeTrackerOptions` (`irisScale`, filter cutoffs), the constants at the top of `engine/lens-renderer.ts`, and `LENS_OPACITY` in `TryOnScreen.tsx`.
 
 ### Checking lens fit
 
-Run `npm run dev` and open http://localhost:3000/dev/lens-fit.html. It runs the real FaceLandmarker on face photos (put them in `dev/fixtures/`, which is gitignored, or pick files on the page) and shows the old engine, the new clipped lens, realistic mode and the original photo side by side with a fit score.
+Run `npm run dev` and open http://localhost:3000/dev/lens-fit.html. It runs the real FaceLandmarker on face photos (put them in `dev/fixtures/`, which is gitignored, or pick files on the page) and shows the old engine, the new clipped lens, the live pipeline (pixel refinement, elliptical lens, smoothed outline, realistic mode) and the original photo side by side, with a fit score and how far the pixel refinement moved each iris.
 
 ## Deployment
 
