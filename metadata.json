@@ -1,0 +1,7 @@
+{
+  "name": "BETO Luxury Lenses",
+  "description": "A premium mobile experience for BETO, a luxury contact lens brand. Browse exquisite collections and try them on virtually using AI-powered vision.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
