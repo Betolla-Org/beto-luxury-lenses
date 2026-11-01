@@ -2,12 +2,18 @@ import { describe, expect, it } from 'vitest';
 import {
   BlinkDetector,
   EyeTracker,
+  IRIS_TO_EYE_WIDTH,
   OneEuroFilter,
   Point,
   RIGHT_EYE,
   coverRect,
   eyeOpenness,
+  lensFitScore,
+  lensStyle,
   mapLandmark,
+  pointInPolygon,
+  measureContourEye,
+  measureMediaPipeEye,
   parseHex,
   shiftColor,
 } from '.';
@@ -35,6 +41,16 @@ describe('color', () => {
     expect(parseHex('#D4AF37')).toEqual({ r: 212, g: 175, b: 55 });
     expect(parseHex('fff')).toEqual({ r: 255, g: 255, b: 255 });
     expect(parseHex('not-a-color')).toEqual({ r: 0, g: 0, b: 0 });
+  });
+
+  it('builds the lens palette from the base color', () => {
+    const s = lensStyle('#808080');
+    expect(s.ring.color).toBe('rgba(68, 68, 68, 0.5)');
+    expect(s.body.stops.map(x => x.color)).toEqual([
+      'rgba(178, 178, 178, 0.8)',
+      'rgba(128, 128, 128, 0.9)',
+      'rgba(68, 68, 68, 0.8)',
+    ]);
   });
 
   it('clamps shifted channels', () => {
@@ -84,11 +100,69 @@ describe('blink detection', () => {
   });
 });
 
+describe('lensFitScore', () => {
+  // Eye opening 40 wide, 16 tall: the lids cut the top and bottom off a 12px-radius iris
+  const outline = Array.from({ length: 24 }, (_, i) => {
+    const a = (i / 24) * Math.PI * 2;
+    return { x: 20 * Math.cos(a), y: 8 * Math.sin(a) };
+  });
+  const iris = { x: 0, y: 0, r: 12 };
+
+  it('is perfect for an iris-sized lens clipped to the eye', () => {
+    expect(lensFitScore(iris, iris, outline, true)).toBeGreaterThan(0.99);
+  });
+
+  it('drops when the lens paints over the eyelids', () => {
+    expect(lensFitScore(iris, iris, outline, false)).toBeLessThan(0.8);
+  });
+
+  it('drops for an oversized, off-center lens', () => {
+    expect(lensFitScore({ x: 3, y: 0, r: 12 * 1.15 }, iris, outline, true)).toBeLessThan(0.85);
+  });
+});
+
+describe('pointInPolygon', () => {
+  const square = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
+  it('tells inside from outside', () => {
+    expect(pointInPolygon({ x: 5, y: 5 }, square)).toBe(true);
+    expect(pointInPolygon({ x: 15, y: 5 }, square)).toBe(false);
+  });
+});
+
+describe('measureContourEye', () => {
+  // Ellipse outline 40px wide, `height` tall, centered at (100, 60)
+  const ellipse = (height: number, n = 16): Point[] =>
+    Array.from({ length: n }, (_, i) => {
+      const a = (i / n) * Math.PI * 2;
+      return { x: 100 + 20 * Math.cos(a), y: 60 + (height / 2) * Math.sin(a) };
+    });
+
+  it('finds the center, width-based iris size and openness of an eye outline', () => {
+    const m = measureContourEye(ellipse(12))!;
+    expect(m.center.x).toBeCloseTo(100);
+    expect(m.center.y).toBeCloseTo(60);
+    expect(m.irisDiameter).toBeCloseTo(40 * IRIS_TO_EYE_WIDTH, 0);
+    expect(m.openness).toBeCloseTo(12 / 40, 1);
+  });
+
+  it('reads a nearly flat outline as closed', () => {
+    expect(measureContourEye(ellipse(2))!.openness).toBeLessThan(0.16);
+  });
+
+  it('rejects degenerate outlines', () => {
+    expect(measureContourEye([{ x: 0, y: 0 }, { x: 1, y: 1 }])).toBeNull();
+  });
+});
+
 describe('EyeTracker', () => {
   const buildFace = (lidGap: number): Point[] => {
     const lm: Point[] = [];
     const set = (i: number, x: number, y: number) => (lm[i] = { x, y });
-    const { iris, lids, corners } = RIGHT_EYE;
+    const { iris, lids, corners, outline } = RIGHT_EYE;
+    outline.forEach((idx, k) => {
+      const a = (k / outline.length) * Math.PI * 2;
+      set(idx, 50 + 15 * Math.cos(a), 50 + (lidGap / 2) * Math.sin(a));
+    });
     set(iris.center, 50, 50);
     set(iris.top, 50, 45);
     set(iris.bottom, 50, 55);
@@ -101,17 +175,20 @@ describe('EyeTracker', () => {
     return lm;
   };
   const identity = (p: Point) => p;
+  const measure = (lm: Point[]) => measureMediaPipeEye(lm, RIGHT_EYE, identity);
 
-  it('places the lens on the iris and scales it', () => {
-    const eye = new EyeTracker(RIGHT_EYE, { irisScale: 1 }).update(buildFace(10), identity, 1.2, 0);
-    expect(eye).toEqual({ x: 50, y: 50, radius: 6 });
+  it('places the lens on the iris, sizes it to the iris and carries the eye outline', () => {
+    const eye = new EyeTracker().update(measure(buildFace(10)), 1.2, 0)!;
+    expect({ x: eye.x, y: eye.y, radius: eye.radius }).toEqual({ x: 50, y: 50, radius: 6 });
+    expect(eye.outline).toHaveLength(RIGHT_EYE.outline.length);
   });
 
   it('hides the lens while the eye is closed', () => {
-    expect(new EyeTracker(RIGHT_EYE).update(buildFace(1), identity, 1, 0)).toBeNull();
+    expect(new EyeTracker().update(measure(buildFace(1)), 1, 0)).toBeNull();
   });
 
   it('returns null when landmarks are missing', () => {
-    expect(new EyeTracker(RIGHT_EYE).update([], identity, 1, 0)).toBeNull();
+    expect(measure([])).toBeNull();
+    expect(new EyeTracker().update(null, 1, 0)).toBeNull();
   });
 });

@@ -7,13 +7,12 @@ import {
   LEFT_EYE,
   RIGHT_EYE,
   Point,
-  addWatermark,
   clamp,
   coverRect,
-  drawLens,
   mapLandmark,
-  shareImage,
+  measureMediaPipeEye,
 } from '../engine';
+import { addWatermark, drawLens, shareImage } from '../engine/web';
 
 // --- CONFIGURATION ---
 const LENS_OPACITY = 0.65; // 35% transparent (65% opaque) so color shows properly
@@ -56,8 +55,8 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
 
   // Per-eye smoothing + blink state, kept outside React so the render loop never re-renders
   const eyeTrackers = useRef({
-    right: new EyeTracker(RIGHT_EYE),
-    left: new EyeTracker(LEFT_EYE),
+    right: new EyeTracker(),
+    left: new EyeTracker(),
   });
   // The render loop is started once, so it reads the size through a ref, not the stale state
   const sizeAdjustmentRef = useRef(sizeAdjustment);
@@ -182,9 +181,13 @@ const TryOnScreen: React.FC<TryOnScreenProps> = ({ lens: initialLens, onBack, le
       const now = performance.now();
       const color = currentLensRef.current.color;
 
-      for (const tracker of [eyeTrackers.current.right, eyeTrackers.current.left]) {
-          const eye = tracker.update(landmarks, project, sizeAdjustmentRef.current, now);
-          if (eye) drawLens(ctx, eye.x, eye.y, eye.radius, color, { opacity: LENS_OPACITY });
+      const eyes = [
+          { tracker: eyeTrackers.current.right, indices: RIGHT_EYE },
+          { tracker: eyeTrackers.current.left, indices: LEFT_EYE },
+      ];
+      for (const { tracker, indices } of eyes) {
+          const eye = tracker.update(measureMediaPipeEye(landmarks, indices, project), sizeAdjustmentRef.current, now);
+          if (eye) drawLens(ctx, eye.x, eye.y, eye.radius, color, { opacity: LENS_OPACITY, clip: eye.outline, realistic: true });
       }
   };
 

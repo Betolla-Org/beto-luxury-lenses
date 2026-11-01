@@ -14,7 +14,18 @@ export const getDistance = (p1: Point, p2: Point) => Math.hypot(p1.x - p2.x, p1.
 
 export const lerp = (start: number, end: number, factor: number) => start + (end - start) * factor;
 
-export const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+/** Even-odd ray casting test. */
+export const pointInPolygon = (p: Point, polygon: Point[]) => {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const a = polygon[i];
+    const b = polygon[j];
+    if (a.y > p.y !== b.y > p.y && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+};
+
+export const clamp =(value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
 /**
  * Where a source of `srcW x srcH` lands inside a `dstW x dstH` box under `object-fit: cover`.

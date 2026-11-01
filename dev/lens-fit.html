@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lens Fit Preview</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js" crossorigin="anonymous"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; padding: 16px; background: #0a0a0a; color: #eee; font: 14px/1.5 system-ui, sans-serif; }
+    h1 { color: #d4af37; font-size: 20px; margin: 0 0 4px; }
+    p.note { color: #999; margin: 0 0 16px; max-width: 760px; }
+    .summary { font-size: 16px; margin-bottom: 16px; }
+    .summary b { color: #d4af37; }
+    .photo { margin-bottom: 28px; }
+    .photo h2 { font-size: 14px; color: #aaa; margin: 0 0 8px; font-weight: 500; }
+    .rows { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; max-width: 900px; }
+    figure { margin: 0; }
+    figure canvas { width: 100%; border-radius: 8px; display: block; }
+    figcaption { font-size: 12px; color: #bbb; margin-top: 4px; }
+    .old { color: #ef8a8a; } .new { color: #8ae0a0; }
+    #status { color: #d4af37; }
+  </style>
+</head>
+<body>
+  <h1>Lens fit: old vs new engine</h1>
+  <p class="note">
+    Runs the same MediaPipe FaceMesh as the live try-on on still photos. Fit = overlap (IoU) between the painted lens and
+    the visible iris, where "visible iris" is MediaPipe's iris circle minus whatever the eyelids cover. Paint on the lids or
+    the white of the eye lowers it.
+  </p>
+  <p><label>Test your own photos: <input type="file" id="pick" accept="image/*" multiple /></label></p>
+  <div id="status">Loading model…</div>
+  <div class="summary" id="summary"></div>
+  <div id="out"></div>
+  <script type="module" src="./lens-fit.ts"></script>
+</body>
+</html>

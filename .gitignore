@@ -31,3 +31,10 @@ dist-ssr
 # Test / tooling output
 coverage
 graphify-out
+
+# Local face photos for dev/lens-fit.html (may be licensed or private)
+dev/fixtures
+
+# Local tool state
+.netlify
+.claude
