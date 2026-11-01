@@ -17,6 +17,25 @@ npm run ios       # macOS + Xcode only
 After the first native build, `npx expo start` is enough for JS-only changes.
 Cloud builds without local SDKs: `npx eas-cli@latest build --profile development`.
 
+### Building on Windows
+
+Native C++ object paths from `node_modules` go past Windows' 260-character limit, and the Android SDK's
+default CMake 3.22 ships a `ninja` that cannot handle long paths. What worked (Nov 2026):
+
+1. Copy the repo to a short folder (e.g. `C:\bb`) without its root `node_modules`, `.git` and `dist`.
+2. `npx expo prebuild --platform android`
+3. In `android/app/build.gradle`, inside `android {`, add:
+   `externalNativeBuild { cmake { buildStagingDirectory = file("C:/x"); version = "3.31.6" } }`
+   (needs CMake 3.31.6 from the SDK Manager and Windows long paths enabled).
+4. `cd android && gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,x86_64`
+
+The APK lands in `android/app/build/outputs/apk/release/`. It is signed with the debug key: fine for
+testing, not for the Play Store. EAS cloud builds avoid all of this.
+
+Release builds shrink code with R8; the keep rules in `app.json` (`expo-build-properties`) stop it from
+renaming the Nitro classes that VisionCamera and the face detector look up from C++. Without them the
+try-on screen crashes on open.
+
 ## How the try-on works
 
 | Step | Code |

@@ -17,7 +17,9 @@
     },
     "android": {
       "package": "com.betolla.betolenses",
-      "permissions": ["android.permission.CAMERA"],
+      "permissions": [
+        "android.permission.CAMERA"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#0A0A0A",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -26,7 +28,19 @@
       },
       "predictiveBackGestureEnabled": false
     },
-    "plugins": ["expo-router", "expo-font", "expo-image"],
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      "expo-image",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "extraProguardRules": "# Nitro modules (VisionCamera, face detector, nitro-image) are looked up from C++ by class name\n-keep class com.margelo.nitro.** { *; }\n-keep class com.mrousavy.** { *; }\n-keep class com.google.mlkit.** { *; }"
+          }
+        }
+      ]
+    ],
     "experiments": {
       "typedRoutes": true
     }
